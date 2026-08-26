@@ -137,13 +137,16 @@ def LeanLib.recBuildShared (self : LeanLib) : FetchM (Job Dynlib) := do
     -- for situations that need them (see `Dynlib.deps`)
     let imps ← mods.foldlM (init := OrdModuleSet.empty) fun imps mod => do
       return imps.appendArray (← (← mod.transImports.fetch).await)
-    let s := (NameSet.empty.insert self.name, #[])
-    let (_, jobs) ← imps.foldlM (init := s) fun (libs, jobs) imp => do
-      if libs.contains imp.lib.name then
-        return (libs, jobs)
+    -- An import outside this library is taken module by module rather than
+    -- through its library's dynlib: two libraries may import each other's
+    -- modules, and depending on the whole library would make each wait on the
+    -- other, while an import from another package would pull that package's
+    -- every module into a native build.
+    let jobs ← imps.foldlM (init := #[]) fun jobs imp => do
+      if imp.lib.name = self.name then
+        return jobs
       else
-        let jobs ← jobs.push <$> imp.lib.shared.fetch
-        return (libs.insert imp.lib.name, jobs)
+        return jobs.push (← imp.dynlib.fetch)
     let jobs ← self.moreLinkLibs.foldlM
       (·.push <$> ·.fetchIn self.pkg) jobs
     let jobs ← self.pkg.externLibs.foldlM

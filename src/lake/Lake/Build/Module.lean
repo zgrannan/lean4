@@ -125,25 +125,50 @@ public def Module.precompileImportsFacetConfig : ModuleFacetConfig precompileImp
   mkFacetJobConfig recComputePrecompileImports (buildable := false)
 
 /--
-Computes the transitive dynamic libraries of a module's imports.
-Modules from the same library are loaded individually, while modules
-from other libraries are loaded as part of the whole library.
+Computes the dynamic libraries a module loads to elaborate its own source,
+one per precompiled library among its imports.
+
+A module *of* a precompiled library loads none of its own package's: the
+library's dynlib is linked from this module's object file among others, so it
+cannot exist yet, and loading the imports one by one instead costs more than
+the interpreter saves. Native code loaded from a shared object is relocated
+once per process, whereas the interpreter reads the same IR from an olean
+mapped by every process at once; measured over 24 modules of this shape,
+per-module loading beat the interpreter 1.78x when run one at a time and lost
+to it at 0.76x when run 24 at a time, while one merged library object won both
+(2.8x and 2.7x). Precompilation is therefore for a library's *consumers*,
+which load it whole.
+
+Consequently a precompiled library should be closed under the imports of its
+own modules. One that imports another precompiled library of the same package
+still works, but its consumers then load an object per library rather than one.
 -/
 def Module.fetchImportLibs
-  (self : Module) (imps : Array Module) (compileSelf : Bool)
+  (self : Module) (imps : Array Module)
 : FetchM (Array (Job Dynlib)) := do
+  let ownPkg? := if self.shouldPrecompile then some self.pkg.name else none
   let (_, jobs) ← imps.foldlM (init := (({} : NameSet), #[])) fun (libs, jobs) imp => do
     if libs.contains imp.lib.name then
       return (libs, jobs)
-    else if compileSelf && self.lib.name = imp.lib.name then
-      let job ← imp.dynlib.fetch
-      return (libs, jobs.push job)
-    else if compileSelf || imp.shouldPrecompile then
-      let jobs ← jobs.push <$> imp.lib.shared.fetch
-      return (libs.insert imp.lib.name, jobs)
+    else if imp.shouldPrecompile && ownPkg? != some imp.pkg.name then
+      return (libs.insert imp.lib.name, jobs.push (← imp.lib.shared.fetch))
     else
       return (libs, jobs)
   return jobs
+
+/--
+Computes the dynamic libraries a module's own dynlib links against.
+
+Unlike the libraries a module *loads*, these are taken module by module:
+libraries whose modules import each other -- legal, because the import graph is
+acyclic at module granularity -- would otherwise wait on each other's `shared`
+facet, and an import from another package would pull that package's every
+module into a native build for the sake of the few that are imported.
+-/
+def Module.fetchLinkImportLibs
+  (_self : Module) (imps : Array Module)
+: FetchM (Array (Job Dynlib)) :=
+  imps.foldlM (init := #[]) fun jobs imp => return jobs.push (← imp.dynlib.fetch)
 
 /--
 Fetches the library dynlibs of a list of non-local imports.
@@ -156,8 +181,7 @@ def fetchImportLibs
     if libs.contains imp.lib.name then
       return (libs, jobs)
     else if imp.shouldPrecompile then
-      let jobs ← jobs.push <$> imp.lib.shared.fetch
-      return (libs.insert imp.lib.name, jobs)
+      return (libs.insert imp.lib.name, jobs.push (← imp.lib.shared.fetch))
     else
       return (libs, jobs)
   return Job.collectArray jobs "import dynlibs"
@@ -572,7 +596,7 @@ def Module.recFetchPreSetup (mod : Module) : FetchM (Job ModulePreSetup) := ensu
     mod.transImports.fetch else mod.precompileImports.fetch
   let precompileImports ← precompileImports.await
   let impLibsJob ← Job.collectArray (traceCaption := "import dynlibs") <$>
-    mod.fetchImportLibs precompileImports mod.shouldPrecompile
+    mod.fetchImportLibs precompileImports
 
   let externLibsJob ← Job.collectArray (traceCaption := "package external libraries") <$>
     if mod.shouldPrecompile then mod.pkg.externLibs.mapM (·.dynlib.fetch) else pure #[]
@@ -1343,7 +1367,7 @@ def Module.recBuildDynlib (mod : Module) : FetchM (Job Dynlib) :=
   -- Fetch dependencies' dynlibs
   let libJobs ← id do
     let imps ← (← mod.imports.fetch).await
-    let libJobs ← mod.fetchImportLibs imps true
+    let libJobs ← mod.fetchLinkImportLibs imps
     let libJobs ← mod.lib.moreLinkLibs.foldlM
       (·.push <$> ·.fetchIn mod.pkg) libJobs
     let libJobs ← mod.pkg.externLibs.foldlM
@@ -1427,7 +1451,7 @@ def setupEditedModule
     else
       (← computePrecompileImportsAux fileName localImports).await
   let impLibsJob ← Job.collectArray (traceCaption := "import dynlibs") <$>
-    mod.fetchImportLibs precompileImports mod.shouldPrecompile
+    mod.fetchImportLibs precompileImports
   let externLibsJob ← Job.collectArray (traceCaption := "package external libraries") <$>
     if mod.shouldPrecompile then mod.pkg.externLibs.mapM (·.dynlib.fetch) else pure #[]
   let dynlibsJob ← mod.dynlibs.fetchIn mod.pkg "module dynlibs"
