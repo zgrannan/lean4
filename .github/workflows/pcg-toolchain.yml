@@ -14,13 +14,24 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  TOOLCHAIN: lean-pcg-linux_aarch64
-
 jobs:
   build:
-    runs-on: ubuntu-24.04-arm
+    name: build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            os: ubuntu-24.04-arm
+            # inline LSE atomics; every aarch64 CPU of the last years has them
+            march: -march=armv8.2-a
+          - arch: x86_64
+            os: ubuntu-24.04
+            march: ""
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 300
+    env:
+      TOOLCHAIN: lean-pcg-linux_${{ matrix.arch }}
     steps:
       - uses: actions/checkout@v4
 
@@ -33,15 +44,15 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/ccache
-          key: ccache-${{ github.sha }}
-          restore-keys: ccache-
+          key: ccache-${{ matrix.arch }}-${{ github.sha }}
+          restore-keys: ccache-${{ matrix.arch }}-
 
       - name: Configure
         run: |
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release -DSTRIP_BINARIES=ON -DWFAIL=OFF \
             -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
-            -DLEAN_EXTRA_CXX_FLAGS=-march=armv8.2-a -DLEANC_EXTRA_CC_FLAGS=-march=armv8.2-a
+            -DLEAN_EXTRA_CXX_FLAGS="${{ matrix.march }}" -DLEANC_EXTRA_CC_FLAGS="${{ matrix.march }}"
 
       - name: Build
         run: make -C build -j"$(nproc)"
@@ -50,8 +61,9 @@ jobs:
         run: |
           cmake --install build/stage1 --prefix "$PWD/dist/$TOOLCHAIN"
           # `libleanshared.so` needs libuv at run time and executables built by `leanc` link it
-          cp -L /usr/lib/aarch64-linux-gnu/libuv.so.1 "dist/$TOOLCHAIN/lib/lean/"
-          cp /usr/lib/aarch64-linux-gnu/libuv.a "dist/$TOOLCHAIN/lib/lean/"
+          libdir=/usr/lib/${{ matrix.arch }}-linux-gnu
+          cp -L "$libdir/libuv.so.1" "dist/$TOOLCHAIN/lib/lean/"
+          cp "$libdir/libuv.a" "dist/$TOOLCHAIN/lib/lean/"
 
       - name: Smoke test
         run: |
@@ -67,7 +79,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: pcg-lean-linux_aarch64
+          name: pcg-lean-linux_${{ matrix.arch }}
           path: ${{ env.TOOLCHAIN }}.tar
           compression-level: 6
           retention-days: 90
