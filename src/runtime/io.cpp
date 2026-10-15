@@ -1407,13 +1407,13 @@ extern "C" LEAN_EXPORT obj_res lean_io_app_path() {
     // Linux version
     char path[PATH_MAX];
     char dest[PATH_MAX];
-    memset(dest, 0, PATH_MAX);
     pid_t pid = getpid();
     snprintf(path, PATH_MAX, "/proc/%d/exe", pid);
-    if (readlink(path, dest, PATH_MAX - 1) == -1) {
+    ssize_t len = readlink(path, dest, PATH_MAX - 1);
+    if (len == -1) {
         return io_result_mk_error("failed to locate application");
     } else {
-        return io_result_mk_ok(mk_string(dest));
+        return io_result_mk_ok(mk_string(std::string(dest, len)));
     }
 #endif
 }
