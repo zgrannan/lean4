@@ -408,6 +408,7 @@ public:
 struct param_meta {
     type m_type;
     bool m_borrow;
+    bool m_scalar;
 };
 
 struct ccode;
@@ -858,6 +859,7 @@ static tl_ir_state & tl_state() {
 }
 
 static bool g_ir_compile_enabled = true;
+static unsigned g_ir_compile_threshold = 1;
 
 static inline bool is_persistent_object(object * o) {
     return !is_scalar(o) && !lean_has_rc(o);
@@ -912,8 +914,8 @@ class interpreter {
     }
 
 public:
-    template<class T>
-    static inline T with_interpreter(elab_environment const & env, options const & opts, name const & fn, std::function<T(interpreter &)> const & f) {
+    template<class T, class F>
+    static inline T with_interpreter(elab_environment const & env, options const & opts, name const & fn, F && f) {
         if (g_interpreter && is_eqp(g_interpreter->m_env, env) && is_eqp(g_interpreter->m_opts, opts)) {
             return f(*g_interpreter);
         } else {
@@ -1107,6 +1109,12 @@ private:
                 return !is_scalar(var(expr_is_tagged_ptr_obj(e)).m_obj);
         }
         throw exception(sstream() << "unexpected instruction kind " << static_cast<unsigned>(expr_tag(e)));
+    }
+
+    unsigned m_check_tick = 0;
+    /** \brief Same as `check_system`, but only every fourth time; compiled code can afford a coarser check. */
+    inline void check_system_sampled() {
+        if (LEAN_UNLIKELY((++m_check_tick & 3) == 0)) check_system();
     }
 
     void check_system() {
@@ -1316,7 +1324,7 @@ private:
         array_ref<param> const & ps = decl_params(e.m_decl);
         e.m_params.reserve(ps.size());
         for (param const & p : ps) {
-            e.m_params.push_back({ param_type(p), param_borrow(p) });
+            e.m_params.push_back({ param_type(p), param_borrow(p), type_is_scalar(param_type(p)) });
         }
         e.m_ret_type = decl_type(e.m_decl);
         e.m_persistent = is_persistent_object(e.m_decl.raw());
@@ -1393,10 +1401,11 @@ private:
     }
 
     /** \brief Evaluate nullary function ("constant"). */
-    value load(name const & fn, type t) {
+    value load(name const & fn, type t, bool * stable = nullptr) {
         tl_ir_state & st = tl_state();
         auto tc = st.m_consts.find(fn);
         if (tc != st.m_consts.end()) {
+            if (stable) *stable = true;
             return tc->second.m_val;
         }
         auto cached_entry = m_constant_cache.find(fn);
@@ -1462,6 +1471,7 @@ private:
             // the thread, just like the value of a natively compiled constant is shared by the process.
             if (!type_is_scalar(t)) mark_persistent(r.m_obj);
             st.m_consts.insert({ fn, tl_const { type_is_scalar(t), r } });
+            if (stable) *stable = true;
         } else {
             m_constant_cache.insert({ fn, constant_cache_entry { type_is_scalar(t), r } });
         }
@@ -1540,7 +1550,7 @@ private:
         tl_ir_state & st = tl_state();
         tl_code_entry & slot = st.m_codes[o];
         if (slot.m_tried) return slot.m_code;
-        if (!force && ++slot.m_calls < 2) {
+        if (!force && ++slot.m_calls < g_ir_compile_threshold) {
             *final = false;
             return nullptr;
         }
@@ -1605,7 +1615,7 @@ private:
         for (uint32_t i = 0; i < n->m_nargs; i++) {
             type t = s.m_params[i].m_type;
             value v = n->m_args[i] == IRRELEVANT_ARG ? value(box(0)) : fp[n->m_args[i]];
-            args2[i] = box_t(v, t);
+            args2[i] = LEAN_LIKELY(!s.m_params[i].m_scalar) ? v.m_obj : box_t(v, t);
             if (s.m_native.m_boxed && s.m_params[i].m_borrow) {
                 // see `call`
                 lean_assert(!type_is_scalar(t));
@@ -1624,7 +1634,12 @@ private:
     }
 
     __attribute__((noinline)) value pap_node(cnode const * n, value * fp) {
-        symbol_cache_entry & sym = lookup_symbol_ref(n->m_fn);
+        symbol_cache_entry * sp = n->m_sym;
+        if (LEAN_UNLIKELY(!sp)) {
+            sp = &lookup_symbol_ref(n->m_fn);
+            if (sp->m_persistent) const_cast<cnode *>(n)->m_sym = sp;
+        }
+        symbol_cache_entry & sym = *sp;
         if (sym.m_native.m_addr) {
             // point closure directly at native symbol
             object * cls = alloc_closure(sym.m_native.m_addr, sym.m_params.size(), n->m_nargs);
@@ -1652,7 +1667,7 @@ private:
 
     /** \brief Execute compiled code in the frame starting at `bp`; the arguments are already stored there. */
     value run(ccode const * c, size_t bp) {
-        check_system();
+        check_system_sampled();
         m_arg_stack.resize(bp + c->m_frame_size);
         value * fp = m_arg_stack.data() + bp;
 #define LEAN_IR_ARG(i) ((i) == IRRELEVANT_ARG ? value(box(0)) : fp[(i)])
@@ -1762,14 +1777,24 @@ private:
                 for (uint32_t i = 0; i < n->m_nargs; i++) {
                     fp[i] = tmp[i];
                 }
-                check_system();
+                check_system_sampled();
                 n = c->m_entry;
                 break;
             }
             case ck::Const: {
-                value r = load(n->m_fn, n->m_ty);
-                LEAN_IR_REFRESH();
-                fp[n->m_dst] = r;
+                if (n->m_flag) {
+                    fp[n->m_dst] = n->m_lit;
+                } else {
+                    bool stable = false;
+                    value r = load(n->m_fn, n->m_ty, &stable);
+                    LEAN_IR_REFRESH();
+                    fp[n->m_dst] = r;
+                    if (stable) {
+                        // the value of an imported constant never changes within an epoch
+                        const_cast<cnode *>(n)->m_lit = r;
+                        const_cast<cnode *>(n)->m_flag = true;
+                    }
+                }
                 n = n->m_next;
                 break;
             }
@@ -2131,6 +2156,7 @@ extern "C" LEAN_EXPORT object * lean_run_init(object * env, object * opts, objec
 
 void initialize_ir_interpreter() {
     if (getenv("LEAN_IR_NO_COMPILE")) ir::g_ir_compile_enabled = false;
+    if (char const * t = getenv("LEAN_IR_COMPILE_THRESHOLD")) ir::g_ir_compile_threshold = atoi(t);
     ir::g_interpreter_prefer_native = new name({"interpreter", "prefer_native"});
     mark_persistent(ir::g_interpreter_prefer_native->raw());
     ir::g_init_globals = new name_hash_map<object *>();
