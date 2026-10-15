@@ -52,6 +52,8 @@ jobs:
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release -DSTRIP_BINARIES=ON -DWFAIL=OFF \
             -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
+            -DLEAN_STANDALONE=ON \
+            "-DLEAN_EXTRA_LINKER_FLAGS=-Wl,--as-needed -lgmp -luv -lssl -lcrypto -lpthread -ldl -lrt -Wl,--no-as-needed" \
             -DLEAN_EXTRA_CXX_FLAGS="${{ matrix.march }}" -DLEANC_EXTRA_CC_FLAGS="${{ matrix.march }}"
 
       - name: Build
@@ -60,10 +62,12 @@ jobs:
       - name: Install
         run: |
           cmake --install build/stage1 --prefix "$PWD/dist/$TOOLCHAIN"
-          # `libleanshared.so` needs libuv at run time and executables built by `leanc` link it
+          # `leanc` links executables with `-lgmp -lssl -lcrypto -luv` (see `--print-ldflags`) and
+          # looks in the toolchain first, so the machines that use it need no development packages;
+          # `libleanshared.so` needs libuv at run time
           libdir=/usr/lib/${{ matrix.arch }}-linux-gnu
           cp -L "$libdir/libuv.so.1" "dist/$TOOLCHAIN/lib/lean/"
-          cp "$libdir/libuv.a" "dist/$TOOLCHAIN/lib/lean/"
+          cp "$libdir"/{libuv,libgmp,libssl,libcrypto}.a "dist/$TOOLCHAIN/lib/lean/"
 
       - name: Smoke test
         run: |
@@ -72,6 +76,12 @@ jobs:
           lake --version
           printf 'def x : Nat := 1\n#eval x + 1\ntheorem t : x = 1 := rfl\n' > /tmp/smoke.lean
           lean /tmp/smoke.lean
+          # no flag may name a library of this machine
+          if leanc --print-ldflags | tr ' ' '\n' | grep '^/usr/'; then exit 1; fi
+          printf 'def main : IO Unit := IO.println s!"{(2 : Nat) ^ 100}"\n' > /tmp/Main.lean
+          lean /tmp/Main.lean -c /tmp/main.c
+          leanc /tmp/main.c -o /tmp/hello
+          /tmp/hello
 
       - name: Package
         # a plain tar: the artifact upload compresses it, and the consumer needs nothing but Python
