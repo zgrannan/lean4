@@ -27,7 +27,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ccache libgmp-dev libuv1-dev libssl-dev pkgconf zstd
+          sudo apt-get install -y cmake ccache libgmp-dev libuv1-dev libssl-dev pkgconf
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -62,12 +62,13 @@ jobs:
           lean /tmp/smoke.lean
 
       - name: Package
-        run: tar --zstd -C dist -cf "$TOOLCHAIN.tar.zst" "$TOOLCHAIN"
+        # a plain tar: the artifact upload compresses it, and the consumer needs nothing but Python
+        run: tar -C dist -cf "$TOOLCHAIN.tar" "$TOOLCHAIN"
 
       - uses: actions/upload-artifact@v4
         with:
           name: pcg-lean-linux_aarch64
-          path: ${{ env.TOOLCHAIN }}.tar.zst
-          compression-level: 0
+          path: ${{ env.TOOLCHAIN }}.tar
+          compression-level: 6
           retention-days: 90
           if-no-files-found: error
