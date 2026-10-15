@@ -29,6 +29,7 @@ Authors: Leonardo de Moura, Gabriel Ebner, Sebastian Ullrich
 #include "util/io.h"
 #include "util/name_map.h"
 #include "library/module.h"
+#include "library/ir_interpreter.h"
 #include "library/constants.h"
 #include "library/time_task.h"
 #include "library/util.h"
@@ -450,6 +451,7 @@ static object * mk_compacted_region(b_obj_arg ofname, object * root,
 // using a type compatible with what was saved (see `CompactedRegion.read`).
 // Supports both `v2` and `v3` formats.
 extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_obj_arg odep_regions, object *) {
+    ir::invalidate_ir_caches();
     std::string olean_fn(lean_string_cstr(ofname));
     try {
         std::vector<region_view> dep_regions = extract_dep_regions(odep_regions);
@@ -619,6 +621,7 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_o
 }
 
 extern "C" LEAN_EXPORT obj_res lean_compacted_region_free(obj_arg region, object *) {
+    ir::invalidate_ir_caches();
     char * buffer = region_buffer(region);
     size_t full_sz = region_size(region);
     bool is_mmap = lean_ctor_get_uint8(region, sizeof(void*) * 5) != 0;
