@@ -30,6 +30,10 @@ functions, which have a (relatively) homogeneous ABI that we can use without run
 #include <string>
 #include <vector>
 #include <shared_mutex>
+#include <atomic>
+#include <deque>
+#include <unordered_map>
+#include <cstdlib>
 #ifdef LEAN_WINDOWS
 #include <windows.h>
 #include <psapi.h>
@@ -377,9 +381,491 @@ struct native_symbol_cache_entry {
 name_hash_map<native_symbol_cache_entry> * g_native_symbol_cache;
 std::shared_mutex * g_native_symbol_cache_mutex;
 
+/* Stack of IR variable values. Unlike `std::vector`, growing does not initialize the new entries. */
+class value_stack {
+    value * m_data = nullptr;
+    size_t m_size = 0;
+    size_t m_cap = 0;
+    void grow(size_t n) {
+        size_t cap = m_cap ? m_cap : 1024;
+        while (cap < n) cap *= 2;
+        m_data = static_cast<value *>(realloc(m_data, cap * sizeof(value)));
+        if (!m_data) lean_internal_panic_out_of_memory();
+        m_cap = cap;
+    }
+public:
+    value_stack() { grow(1024); }
+    ~value_stack() { free(m_data); }
+    value_stack(value_stack const &) = delete;
+    size_t size() const { return m_size; }
+    value * data() { return m_data; }
+    value & operator[](size_t i) { return m_data[i]; }
+    void ensure(size_t n) { if (LEAN_UNLIKELY(n > m_cap)) grow(n); }
+    void resize(size_t n) { ensure(n); m_size = n; }
+    void push_back(value v) { ensure(m_size + 1); m_data[m_size++] = v; }
+};
+
+struct param_meta {
+    type m_type;
+    bool m_borrow;
+};
+
+struct ccode;
+
+struct symbol_cache_entry {
+    // looking up IR from .oleans is slow enough to warrant its own cache; but as local IR can
+    // be backtracked, entries for non-persistent declarations need to be local to an interpreter.
+    decl m_decl;
+    native_symbol_cache_entry m_native;
+    // whether `m_decl` lives forever (compacted region or marked persistent), in which case the
+    // entry may be shared by all interpreters of the thread
+    bool m_persistent = false;
+    type m_ret_type = type::Object;
+    std::vector<param_meta> m_params;
+    // compiled form of `m_decl`, once decided (see `interpreter::entry_code`)
+    ccode * m_code = nullptr;
+    bool m_code_final = false;
+};
+
+/* Pre-decoded IR for persistent declarations. The IR of imported declarations never changes, so
+   it is translated once per thread into this compact form: variable indices are resolved to frame
+   offsets, join points to pointers, literals to values, and callees are resolved lazily and cached
+   in the node. */
+enum class ck : uint8_t {
+    Ctor, ConstBox, Reset, Reuse, Proj, UProj, SProj, Fap, FapSelfTail, Const, Pap, Ap, Box, Unbox,
+    LitObj, LitNum, IsShared, IsTagged,
+    Set, SetTag, USet, SSet, Inc, Dec, Del, Case, Ret, Jmp, JDecl, Unreachable
+};
+
+static constexpr uint32_t IRRELEVANT_ARG = UINT32_MAX;
+
+struct cnode;
+struct cjp {
+    std::vector<uint32_t> m_params;
+    cnode * m_body = nullptr;
+};
+
+struct ccase_alt {
+    bool m_default;
+    uint32_t m_tag;
+    cnode * m_body;
+};
+
+struct cnode {
+    ck m_kind = ck::Unreachable;
+    type m_ty = type::Object;
+    bool m_flag = false;
+    uint32_t m_dst = 0;
+    uint32_t m_a = 0, m_b = 0, m_c = 0;
+    uint32_t m_nargs = 0;
+    uint32_t * m_args = nullptr;
+    object * m_obj = nullptr;
+    value m_lit;
+    name m_fn;
+    symbol_cache_entry * m_sym = nullptr;
+    cnode * m_next = nullptr;
+    ccase_alt * m_alts = nullptr;
+    uint32_t m_nalts = 0;
+    cjp * m_jp = nullptr;
+};
+
+struct ccode {
+    name m_fn;
+    uint32_t m_frame_size = 0;
+    uint32_t m_nparams = 0;
+    cnode * m_entry = nullptr;
+    std::deque<cnode> m_nodes;
+    std::deque<cjp> m_jps;
+    std::deque<std::vector<uint32_t>> m_arrays;
+    std::deque<std::vector<ccase_alt>> m_alt_arrays;
+};
+
+class ir_compiler {
+    ccode & m_c;
+    std::unordered_map<size_t, cjp *> m_jps;
+    uint32_t m_max_var = 0;
+
+    uint32_t var_idx(var_id const & x) {
+        size_t v = x.get_small_value();
+        if (v == 0) throw exception("invalid variable index");
+        if (v > m_max_var) m_max_var = v;
+        return v - 1;
+    }
+    uint32_t arg_idx(arg const & a) { return arg_is_irrelevant(a) ? IRRELEVANT_ARG : var_idx(arg_var_id(a)); }
+    uint32_t * mk_args(array_ref<arg> const & as) {
+        m_c.m_arrays.emplace_back();
+        std::vector<uint32_t> & v = m_c.m_arrays.back();
+        for (arg const & a : as) v.push_back(arg_idx(a));
+        return v.data();
+    }
+    cnode * mk(ck k) {
+        m_c.m_nodes.emplace_back();
+        cnode * n = &m_c.m_nodes.back();
+        n->m_kind = k;
+        return n;
+    }
+
+    void ctor_fields(ctor_info const & i, cnode * n) {
+        n->m_a = ctor_info_tag(i).get_small_value();
+        n->m_b = ctor_info_size(i).get_small_value();
+        size_t usize = ctor_info_usize(i).get_small_value();
+        size_t ssize = ctor_info_ssize(i).get_small_value();
+        n->m_c = usize * sizeof(void *) + ssize;
+        n->m_flag = (n->m_b == 0 && usize == 0 && ssize == 0);
+    }
+
+    cnode * compile_expr(expr const & e, type t, var_id const & dst) {
+        cnode * n = nullptr;
+        switch (expr_tag(e)) {
+        case expr_kind::Ctor: {
+            ctor_info const & i = expr_ctor_info(e);
+            n = mk(ck::Ctor);
+            ctor_fields(i, n);
+            if (n->m_flag) {
+                n->m_kind = ck::ConstBox;
+                n->m_lit = value(box(n->m_a));
+            } else {
+                n->m_nargs = expr_ctor_args(e).size();
+                n->m_args = mk_args(expr_ctor_args(e));
+            }
+            break;
+        }
+        case expr_kind::Reset:
+            n = mk(ck::Reset);
+            n->m_a = var_idx(expr_reset_obj(e));
+            n->m_b = expr_reset_num_objs(e).get_small_value();
+            break;
+        case expr_kind::Reuse: {
+            n = mk(ck::Reuse);
+            n->m_dst = 0;
+            ctor_fields(expr_reuse_ctor(e), n);
+            // `m_a` (tag), `m_b` (objects) and `m_c` (scalar bytes) describe the fallback allocation
+            n->m_lit = value(static_cast<uint64>(var_idx(expr_reuse_obj(e))));
+            n->m_ty = t;
+            n->m_nargs = expr_reuse_args(e).size();
+            n->m_args = mk_args(expr_reuse_args(e));
+            n->m_obj = reinterpret_cast<object *>(static_cast<uintptr_t>(expr_reuse_update_header(e) ? 1 : 0));
+            break;
+        }
+        case expr_kind::Proj:
+            n = mk(ck::Proj);
+            n->m_a = var_idx(expr_proj_obj(e));
+            n->m_b = expr_proj_idx(e).get_small_value();
+            break;
+        case expr_kind::UProj:
+            n = mk(ck::UProj);
+            n->m_a = var_idx(expr_uproj_obj(e));
+            n->m_b = expr_uproj_idx(e).get_small_value();
+            break;
+        case expr_kind::SProj: {
+            n = mk(ck::SProj);
+            n->m_a = var_idx(expr_sproj_obj(e));
+            n->m_b = expr_sproj_idx(e).get_small_value() * sizeof(void *) +
+                     expr_sproj_offset(e).get_small_value();
+            switch (t) {
+            case type::Float: case type::Float32: case type::UInt8: case type::UInt16:
+            case type::UInt32: case type::UInt64:
+                break;
+            default:
+                throw exception("invalid instruction");
+            }
+            break;
+        }
+        case expr_kind::FAp:
+            if (expr_fap_args(e).size()) {
+                n = mk(ck::Fap);
+                n->m_nargs = expr_fap_args(e).size();
+                n->m_args = mk_args(expr_fap_args(e));
+            } else {
+                n = mk(ck::Const);
+            }
+            n->m_fn = expr_fap_fun(e);
+            break;
+        case expr_kind::PAp:
+            n = mk(ck::Pap);
+            n->m_fn = expr_pap_fun(e);
+            n->m_nargs = expr_pap_args(e).size();
+            n->m_args = mk_args(expr_pap_args(e));
+            break;
+        case expr_kind::Ap:
+            n = mk(ck::Ap);
+            n->m_a = var_idx(expr_ap_fun(e));
+            n->m_nargs = expr_ap_args(e).size();
+            n->m_args = mk_args(expr_ap_args(e));
+            break;
+        case expr_kind::Box:
+            n = mk(ck::Box);
+            n->m_a = var_idx(expr_box_obj(e));
+            n->m_ty = expr_box_type(e);
+            break;
+        case expr_kind::Unbox:
+            n = mk(ck::Unbox);
+            n->m_a = var_idx(expr_unbox_obj(e));
+            break;
+        case expr_kind::Lit: {
+            lit_val const & l = expr_lit_val(e);
+            switch (lit_val_tag(l)) {
+            case lit_val_kind::Num: {
+                nat const & num = lit_val_num(l);
+                n = mk(ck::LitNum);
+                switch (t) {
+                case type::Float:
+                    n->m_lit = value::from_float(lean_float_of_nat(num.to_obj_arg()));
+                    break;
+                case type::Float32:
+                    n->m_lit = value::from_float32(lean_float32_of_nat(num.to_obj_arg()));
+                    break;
+                case type::UInt8: case type::UInt16: case type::UInt32: case type::USize:
+                    n->m_lit = value(static_cast<uint64>(lean_usize_of_nat(num.raw())));
+                    break;
+                case type::UInt64:
+                    n->m_lit = value(static_cast<uint64>(lean_uint64_of_nat(num.raw())));
+                    break;
+                case type::Object: case type::Tagged: case type::TObject:
+                    n->m_kind = ck::LitObj;
+                    n->m_obj = num.raw();
+                    break;
+                default:
+                    throw exception("invalid instruction");
+                }
+                break;
+            }
+            case lit_val_kind::Str:
+                n = mk(ck::LitObj);
+                n->m_obj = lit_val_str(l).raw();
+                break;
+            }
+            break;
+        }
+        case expr_kind::IsShared:
+            n = mk(ck::IsShared);
+            n->m_a = var_idx(expr_is_shared_obj(e));
+            break;
+        case expr_kind::IsTaggedPtr:
+            n = mk(ck::IsTagged);
+            n->m_a = var_idx(expr_is_tagged_ptr_obj(e));
+            break;
+        default:
+            throw exception("unexpected instruction kind");
+        }
+        n->m_dst = var_idx(dst);
+        if (n->m_kind != ck::Reuse && n->m_kind != ck::Box) n->m_ty = t;
+        return n;
+    }
+
+    cnode * compile_body(fn_body const & b0) {
+        cnode * head = nullptr;
+        cnode * tail = nullptr;
+        auto append = [&](cnode * n) {
+            if (tail) tail->m_next = n; else head = n;
+            tail = n;
+        };
+        fn_body const * b = &b0;
+        while (true) {
+            switch (fn_body_tag(*b)) {
+            case fn_body_kind::VDecl: {
+                expr const & e = fn_body_vdecl_expr(*b);
+                fn_body const & cont = fn_body_vdecl_cont(*b);
+                type t = fn_body_vdecl_type(*b);
+                if (expr_tag(e) == expr_kind::FAp && expr_fap_fun(e) == m_c.m_fn &&
+                    fn_body_tag(cont) == fn_body_kind::Ret && !arg_is_irrelevant(fn_body_ret_arg(cont)) &&
+                    arg_var_id(fn_body_ret_arg(cont)) == fn_body_vdecl_var(*b)) {
+                    cnode * n = mk(ck::FapSelfTail);
+                    n->m_nargs = expr_fap_args(e).size();
+                    n->m_args = mk_args(expr_fap_args(e));
+                    append(n);
+                    return head;
+                }
+                append(compile_expr(e, t, fn_body_vdecl_var(*b)));
+                b = &cont;
+                break;
+            }
+            case fn_body_kind::JDecl: {
+                size_t id = fn_body_jdecl_id(*b).get_small_value();
+                m_c.m_jps.emplace_back();
+                cjp * jp = &m_c.m_jps.back();
+                for (param const & p : fn_body_jdecl_params(*b)) jp->m_params.push_back(var_idx(param_var(p)));
+                m_jps[id] = jp;
+                jp->m_body = compile_body(fn_body_jdecl_body(*b));
+                append(mk(ck::JDecl));
+                b = &fn_body_jdecl_cont(*b);
+                break;
+            }
+            case fn_body_kind::Set: {
+                cnode * n = mk(ck::Set);
+                n->m_a = var_idx(fn_body_set_var(*b));
+                n->m_b = fn_body_set_idx(*b).get_small_value();
+                n->m_c = arg_idx(fn_body_set_arg(*b));
+                append(n);
+                b = &fn_body_set_cont(*b);
+                break;
+            }
+            case fn_body_kind::SetTag: {
+                cnode * n = mk(ck::SetTag);
+                n->m_a = var_idx(fn_body_set_tag_var(*b));
+                n->m_b = fn_body_set_tag_cidx(*b).get_small_value();
+                append(n);
+                b = &fn_body_set_tag_cont(*b);
+                break;
+            }
+            case fn_body_kind::USet: {
+                cnode * n = mk(ck::USet);
+                n->m_a = var_idx(fn_body_uset_target(*b));
+                n->m_b = fn_body_uset_idx(*b).get_small_value();
+                n->m_c = var_idx(fn_body_uset_source(*b));
+                append(n);
+                b = &fn_body_uset_cont(*b);
+                break;
+            }
+            case fn_body_kind::SSet: {
+                cnode * n = mk(ck::SSet);
+                n->m_a = var_idx(fn_body_sset_target(*b));
+                n->m_b = fn_body_sset_idx(*b).get_small_value() * sizeof(void *) +
+                         fn_body_sset_offset(*b).get_small_value();
+                n->m_c = var_idx(fn_body_sset_source(*b));
+                n->m_ty = fn_body_sset_type(*b);
+                switch (n->m_ty) {
+                case type::Float: case type::Float32: case type::UInt8: case type::UInt16:
+                case type::UInt32: case type::UInt64:
+                    break;
+                default:
+                    throw exception("invalid instruction");
+                }
+                append(n);
+                b = &fn_body_sset_cont(*b);
+                break;
+            }
+            case fn_body_kind::Inc: {
+                cnode * n = mk(ck::Inc);
+                n->m_a = var_idx(fn_body_inc_var(*b));
+                n->m_b = fn_body_inc_val(*b).get_small_value();
+                append(n);
+                b = &fn_body_inc_cont(*b);
+                break;
+            }
+            case fn_body_kind::Dec: {
+                cnode * n = mk(ck::Dec);
+                n->m_a = var_idx(fn_body_dec_var(*b));
+                n->m_b = fn_body_dec_val(*b).get_small_value();
+                append(n);
+                b = &fn_body_dec_cont(*b);
+                break;
+            }
+            case fn_body_kind::Del: {
+                cnode * n = mk(ck::Del);
+                n->m_a = var_idx(fn_body_del_var(*b));
+                append(n);
+                b = &fn_body_del_cont(*b);
+                break;
+            }
+            case fn_body_kind::Case: {
+                cnode * n = mk(ck::Case);
+                n->m_a = var_idx(fn_body_case_var(*b));
+                n->m_flag = type_is_scalar(fn_body_case_var_type(*b));
+                array_ref<alt_core> const & alts = fn_body_case_alts(*b);
+                m_c.m_alt_arrays.emplace_back();
+                std::vector<ccase_alt> & v = m_c.m_alt_arrays.back();
+                for (alt_core const & a : alts) {
+                    switch (alt_core_tag(a)) {
+                    case alt_core_kind::Ctor:
+                        v.push_back({false, static_cast<uint32_t>(ctor_info_tag(alt_core_ctor_info(a)).get_small_value()),
+                                     compile_body(alt_core_ctor_cont(a))});
+                        break;
+                    case alt_core_kind::Default:
+                        v.push_back({true, 0, compile_body(alt_core_default_cont(a))});
+                        break;
+                    }
+                }
+                n->m_alts = v.data();
+                n->m_nalts = v.size();
+                append(n);
+                return head;
+            }
+            case fn_body_kind::Ret: {
+                cnode * n = mk(ck::Ret);
+                n->m_a = arg_idx(fn_body_ret_arg(*b));
+                append(n);
+                return head;
+            }
+            case fn_body_kind::Jmp: {
+                cnode * n = mk(ck::Jmp);
+                auto it = m_jps.find(fn_body_jmp_jp(*b).get_small_value());
+                if (it == m_jps.end()) throw exception("unknown join point");
+                n->m_jp = it->second;
+                n->m_nargs = fn_body_jmp_args(*b).size();
+                n->m_args = mk_args(fn_body_jmp_args(*b));
+                if (n->m_nargs != n->m_jp->m_params.size()) throw exception("invalid join point arity");
+                append(n);
+                return head;
+            }
+            case fn_body_kind::Unreachable:
+                append(mk(ck::Unreachable));
+                return head;
+            default:
+                throw exception("unexpected body kind");
+            }
+        }
+    }
+
+public:
+    explicit ir_compiler(ccode & c) : m_c(c) {}
+
+    void compile(decl const & d) {
+        array_ref<param> const & params = decl_params(d);
+        // The interpreter's calling convention stores parameter `i` at frame offset `i`.
+        for (size_t i = 0; i < params.size(); i++) {
+            if (param_var(params[i]).get_small_value() != i + 1) throw exception("unexpected parameter numbering");
+            var_idx(param_var(params[i]));
+        }
+        m_c.m_nparams = params.size();
+        m_c.m_entry = compile_body(decl_fun_body(d));
+        m_c.m_frame_size = m_max_var;
+    }
+};
+
+/* Process-wide counter bumped whenever the set of loaded compacted regions changes. Per-thread
+   caches of persistent declarations are only valid for one epoch. */
+static std::atomic<uint64_t> g_ir_epoch(1);
+
+struct tl_const {
+    bool m_is_scalar;
+    value m_val;
+};
+
+struct tl_code_entry {
+    ccode * m_code = nullptr;
+    unsigned m_calls = 0;
+    bool m_tried = false;
+};
+
+struct tl_ir_state {
+    uint64_t m_epoch;
+    name_hash_map<symbol_cache_entry *> m_syms;
+    name_hash_map<tl_const> m_consts;
+    std::unordered_map<object *, tl_code_entry> m_codes;
+};
+
+LEAN_THREAD_PTR(tl_ir_state, g_tl_ir_state);
+
+static tl_ir_state & tl_state() {
+    uint64_t e = g_ir_epoch.load(std::memory_order_acquire);
+    if (LEAN_UNLIKELY(!g_tl_ir_state || g_tl_ir_state->m_epoch != e)) {
+        // intentionally leaked: compiled code of the old epoch may still be executing
+        g_tl_ir_state = new tl_ir_state();
+        g_tl_ir_state->m_epoch = e;
+    }
+    return *g_tl_ir_state;
+}
+
+static bool g_ir_compile_enabled = true;
+
+static inline bool is_persistent_object(object * o) {
+    return !is_scalar(o) && !lean_has_rc(o);
+}
+
 class interpreter {
     // stack of IR variable slots
-    std::vector<value> m_arg_stack;
+    value_stack m_arg_stack;
     // stack of join points
     std::vector<fn_body const *> m_jp_stack;
     struct frame {
@@ -401,13 +887,7 @@ class interpreter {
     };
     // caches values of nullary functions ("constants")
     name_hash_map<constant_cache_entry> m_constant_cache;
-    struct symbol_cache_entry {
-        // looking up IR from .oleans is slow enough to warrant its own cache; but as local IR can
-        // be backtracked, this cache needs to be local as well.
-        decl m_decl;
-        native_symbol_cache_entry m_native;
-    };
-    // caches symbol lookup successes _and_ failures
+    // caches symbol lookup successes _and_ failures of non-persistent declarations
     name_hash_map<symbol_cache_entry> m_symbol_cache;
 
     /** \brief Get current stack frame */
@@ -556,7 +1036,7 @@ private:
                 }
             }
             case expr_kind::PAp: { // unsatured (partial) application of top-level function
-                const symbol_cache_entry& sym = lookup_symbol(expr_pap_fun(e));
+                symbol_cache_entry & sym = lookup_symbol_ref(expr_pap_fun(e));
                 if (sym.m_native.m_addr) {
                     // point closure directly at native symbol
                     object * cls = alloc_closure(sym.m_native.m_addr, decl_params(sym.m_decl).size(), expr_pap_args(e).size());
@@ -832,26 +1312,45 @@ private:
        });
     }
 
-    /** \brief Return cached lookup result for given unmangled function name in the current binary. */
-    const symbol_cache_entry& lookup_symbol(name const & fn) {
+    void fill_entry_meta(symbol_cache_entry & e) {
+        array_ref<param> const & ps = decl_params(e.m_decl);
+        e.m_params.reserve(ps.size());
+        for (param const & p : ps) {
+            e.m_params.push_back({ param_type(p), param_borrow(p) });
+        }
+        e.m_ret_type = decl_type(e.m_decl);
+        e.m_persistent = is_persistent_object(e.m_decl.raw());
+    }
+
+    /** \brief Return cached lookup result for given unmangled function name in the current binary.
+        Entries of persistent declarations are shared by all interpreters of the thread. */
+    symbol_cache_entry & lookup_symbol_ref(name const & fn) {
+        tl_ir_state & st = tl_state();
+        auto te = st.m_syms.find(fn);
+        if (te != st.m_syms.end()) {
+            return *te->second;
+        }
         auto e = m_symbol_cache.find(fn);
         if (e != m_symbol_cache.end()) {
             return e->second;
         }
-        std::shared_lock<std::shared_mutex> lock(*g_native_symbol_cache_mutex);
+        symbol_cache_entry e_new;
+        e_new.m_decl = get_decl(fn);
+        {
+            std::shared_lock<std::shared_mutex> lock(*g_native_symbol_cache_mutex);
+            auto ne = g_native_symbol_cache->find(fn);
+            if (ne != g_native_symbol_cache->end()) {
+                e_new.m_native = ne->second;
+                return insert_entry(st, fn, e_new);
+            }
+        }
+        std::unique_lock<std::shared_mutex> unique_lock(*g_native_symbol_cache_mutex);
         auto ne = g_native_symbol_cache->find(fn);
         if (ne != g_native_symbol_cache->end()) {
-            symbol_cache_entry e_new { get_decl(fn), ne->second };
-            return m_symbol_cache.emplace(fn, std::move(e_new)).first->second;
+            e_new.m_native = ne->second;
+            return insert_entry(st, fn, e_new);
         }
-        lock.unlock();
-        std::unique_lock<std::shared_mutex> unique_lock(*g_native_symbol_cache_mutex);
-        ne = g_native_symbol_cache->find(fn);
-        if (ne != g_native_symbol_cache->end()) {
-            symbol_cache_entry e_new { get_decl(fn), ne->second };
-            return m_symbol_cache.emplace(fn, std::move(e_new)).first->second;
-        }
-        symbol_cache_entry e_new { get_decl(fn), {nullptr, false} };
+        e_new.m_native = {nullptr, false};
         if (m_prefer_native || decl_tag(e_new.m_decl) == decl_kind::Extern || has_init_attribute(m_env, fn)) {
             string_ref mangled = get_symbol_stem(m_env, fn);
             string_ref boxed_mangled = mk_mangled_boxed_name(mangled);
@@ -871,7 +1370,17 @@ private:
             }
         }
         g_native_symbol_cache->insert({ fn, e_new.m_native });
-        return m_symbol_cache.emplace(fn, std::move(e_new)).first->second;
+        return insert_entry(st, fn, e_new);
+    }
+
+    symbol_cache_entry & insert_entry(tl_ir_state & st, name const & fn, symbol_cache_entry & e_new) {
+        fill_entry_meta(e_new);
+        if (e_new.m_persistent) {
+            symbol_cache_entry * p = new symbol_cache_entry(e_new);
+            st.m_syms.insert({ fn, p });
+            return *p;
+        }
+        return m_symbol_cache.insert({ fn, e_new }).first->second;
     }
 
     /** \brief Retrieve Lean declaration from elab_environment. */
@@ -885,6 +1394,11 @@ private:
 
     /** \brief Evaluate nullary function ("constant"). */
     value load(name const & fn, type t) {
+        tl_ir_state & st = tl_state();
+        auto tc = st.m_consts.find(fn);
+        if (tc != st.m_consts.end()) {
+            return tc->second.m_val;
+        }
         auto cached_entry = m_constant_cache.find(fn);
         if (cached_entry != m_constant_cache.end()) {
             auto cached = cached_entry->second;
@@ -897,7 +1411,7 @@ private:
             return type_is_scalar(t) ? unbox_t(o, t) : o;
         }
 
-        const symbol_cache_entry& e = lookup_symbol(fn);
+        symbol_cache_entry & e = lookup_symbol_ref(fn);
         if (e.m_native.m_addr) {
             // we can assume that all native code has been initialized (see e.g. `evalConst`)
 
@@ -933,24 +1447,38 @@ private:
         if (fn_body_tag(decl_fun_body(e.m_decl)) == fn_body_kind::Unreachable)
             throw exception(sstream() << "interpreter: cannot evaluate '" << fn
                 << "', its IR body is unreachable (likely a dummy extern from incorrect `meta` phase setup)");
-        push_frame(e.m_decl, m_arg_stack.size());
-        value r = eval_decl_body(e.m_decl);
-        pop_frame(r, t);
-        m_constant_cache.insert({ fn, constant_cache_entry { type_is_scalar(t), r } });
+        size_t old_size = m_arg_stack.size();
+        value r;
+        if (ccode * code = get_code(e.m_decl, true)) {
+            r = run(code, old_size);
+            m_arg_stack.resize(old_size);
+        } else {
+            push_frame(e.m_decl, old_size);
+            r = eval_decl_body(e.m_decl);
+            pop_frame(r, t);
+        }
+        if (e.m_persistent) {
+            // The value of a constant of an imported declaration is shared by all interpreters of
+            // the thread, just like the value of a natively compiled constant is shared by the process.
+            if (!type_is_scalar(t)) mark_persistent(r.m_obj);
+            st.m_consts.insert({ fn, tl_const { type_is_scalar(t), r } });
+        } else {
+            m_constant_cache.insert({ fn, constant_cache_entry { type_is_scalar(t), r } });
+        }
         return r;
     }
 
     value call(name const & fn, array_ref<arg> const & args) {
         size_t old_size = m_arg_stack.size();
         value r;
-        const symbol_cache_entry& e = lookup_symbol(fn);
-        type t = decl_type(e.m_decl);
+        symbol_cache_entry & e = lookup_symbol_ref(fn);
+        type t = e.m_ret_type;
         if (e.m_native.m_addr) {
             object ** args2 = static_cast<object **>(LEAN_ALLOCA(args.size() * sizeof(object *))); // NOLINT
             for (size_t i = 0; i < args.size(); i++) {
-                type t = param_type(decl_params(e.m_decl)[i]);
+                type t = e.m_params[i].m_type;
                 args2[i] = box_t(eval_arg(args[i]), t);
-                if (e.m_native.m_boxed && param_borrow(decl_params(e.m_decl)[i])) {
+                if (e.m_native.m_boxed && e.m_params[i].m_borrow) {
                     // NOTE: If we chose the boxed version where the IR chose the unboxed one, we need to manually increment
                     // originally borrowed parameters because the wrapper will decrement these after the call.
                     // Basically the wrapper is more homogeneous (removing both unboxed and borrowed parameters) than we
@@ -972,17 +1500,15 @@ private:
                 r = o;
             }
         } else {
-            if (decl_tag(e.m_decl) == decl_kind::Extern) {
-                string_ref mangled = get_symbol_stem(m_env, fn);
-                string_ref boxed_mangled = mk_mangled_boxed_name(mangled);
-                throw exception(sstream() << "Could not find native implementation of external declaration '" << fn
-                                          << "' (symbols '" << boxed_mangled.data() << "' or '" << mangled.data() << "').\n"
-                                          << "For declarations from `Init`, `Std`, or `Lean`, you need to set `supportInterpreter := true` "
-                                          << "in the relevant `lean_exe` statement in your `lakefile.lean`.");
-            }
+            throw_if_extern(e, fn);
             // evaluate args in old stack frame
             for (const auto & arg : args) {
                 m_arg_stack.push_back(eval_arg(arg));
+            }
+            if (ccode * code = entry_code(e)) {
+                r = run(code, old_size);
+                m_arg_stack.resize(old_size);
+                return r;
             }
             push_frame(e.m_decl, old_size);
             r = eval_decl_body(e.m_decl);
@@ -991,12 +1517,396 @@ private:
         return r;
     }
 
+    void throw_if_extern(symbol_cache_entry const & e, name const & fn) {
+        if (decl_tag(e.m_decl) == decl_kind::Extern) {
+            string_ref mangled = get_symbol_stem(m_env, fn);
+            string_ref boxed_mangled = mk_mangled_boxed_name(mangled);
+            throw exception(sstream() << "Could not find native implementation of external declaration '" << fn
+                                      << "' (symbols '" << boxed_mangled.data() << "' or '" << mangled.data() << "').\n"
+                                      << "For declarations from `Init`, `Std`, or `Lean`, you need to set `supportInterpreter := true` "
+                                      << "in the relevant `lean_exe` statement in your `lakefile.lean`.");
+        }
+    }
+
+    /** \brief Return the compiled form of a persistent declaration, compiling it on its second call
+        (or immediately if `force`). Returns `nullptr` if the declaration cannot be compiled. */
+    ccode * get_code(decl const & d, bool force = false, bool * final = nullptr) {
+        bool dummy;
+        if (!final) final = &dummy;
+        *final = true;
+        if (!g_ir_compile_enabled) return nullptr;
+        object * o = d.raw();
+        if (!is_persistent_object(o) || decl_tag(d) != decl_kind::Fun) return nullptr;
+        tl_ir_state & st = tl_state();
+        tl_code_entry & slot = st.m_codes[o];
+        if (slot.m_tried) return slot.m_code;
+        if (!force && ++slot.m_calls < 2) {
+            *final = false;
+            return nullptr;
+        }
+        slot.m_tried = true;
+        try {
+            std::unique_ptr<ccode> c(new ccode());
+            c->m_fn = decl_fun_id(d);
+            ir_compiler(*c).compile(d);
+            slot.m_code = c.release();
+        } catch (exception &) {
+            // fall back to the generic interpreter, which reports problems when (and if) they are executed
+            slot.m_code = nullptr;
+        }
+        return slot.m_code;
+    }
+
+    ccode * entry_code(symbol_cache_entry & s) {
+        if (s.m_code || s.m_code_final) return s.m_code;
+        bool final;
+        ccode * c = get_code(s.m_decl, false, &final);
+        if (final) {
+            s.m_code = c;
+            s.m_code_final = true;
+        }
+        return c;
+    }
+
+    /** \brief Call `s` with the arguments `n->m_args` read from the compiled frame at `bp`. */
+    value call_node(symbol_cache_entry & s, cnode const * n, size_t bp) {
+        value * fp = m_arg_stack.data() + bp;
+        if (s.m_native.m_addr) {
+            return call_native_node(s, n, fp);
+        }
+        throw_if_extern(s, n->m_fn);
+        ccode * code = entry_code(s);
+        size_t nb = m_arg_stack.size();
+        if (code) {
+            m_arg_stack.ensure(nb + code->m_frame_size);
+            fp = m_arg_stack.data() + bp;
+            value * nfp = m_arg_stack.data() + nb;
+            for (uint32_t i = 0; i < n->m_nargs; i++) {
+                nfp[i] = n->m_args[i] == IRRELEVANT_ARG ? value(box(0)) : fp[n->m_args[i]];
+            }
+            m_arg_stack.resize(nb + n->m_nargs);
+            value r = run(code, nb);
+            m_arg_stack.resize(nb);
+            return r;
+        }
+        // generic interpreter for declarations without compiled form
+        for (uint32_t i = 0; i < n->m_nargs; i++) {
+            fp = m_arg_stack.data() + bp;
+            m_arg_stack.push_back(n->m_args[i] == IRRELEVANT_ARG ? value(box(0)) : fp[n->m_args[i]]);
+        }
+        push_frame(s.m_decl, nb);
+        value r = eval_body(decl_fun_body(s.m_decl));
+        pop_frame(r, s.m_ret_type);
+        return r;
+    }
+
+    __attribute__((noinline)) value call_native_node(symbol_cache_entry & s, cnode const * n, value * fp) {
+        object ** args2 = static_cast<object **>(LEAN_ALLOCA(n->m_nargs * sizeof(object *))); // NOLINT
+        for (uint32_t i = 0; i < n->m_nargs; i++) {
+            type t = s.m_params[i].m_type;
+            value v = n->m_args[i] == IRRELEVANT_ARG ? value(box(0)) : fp[n->m_args[i]];
+            args2[i] = box_t(v, t);
+            if (s.m_native.m_boxed && s.m_params[i].m_borrow) {
+                // see `call`
+                lean_assert(!type_is_scalar(t));
+                inc(args2[i]);
+            }
+        }
+        object * o = curry(s.m_native.m_addr, n->m_nargs, args2);
+        type t = s.m_ret_type;
+        if (type_is_scalar(t)) {
+            lean_assert(s.m_native.m_boxed);
+            value r = unbox_t(o, t);
+            lean_dec(o);
+            return r;
+        }
+        return o;
+    }
+
+    __attribute__((noinline)) value pap_node(cnode const * n, value * fp) {
+        symbol_cache_entry & sym = lookup_symbol_ref(n->m_fn);
+        if (sym.m_native.m_addr) {
+            // point closure directly at native symbol
+            object * cls = alloc_closure(sym.m_native.m_addr, sym.m_params.size(), n->m_nargs);
+            for (unsigned i = 0; i < n->m_nargs; i++) {
+                closure_set(cls, i, (n->m_args[i] == IRRELEVANT_ARG ? value(box(0)) : fp[n->m_args[i]]).m_obj);
+            }
+            return cls;
+        } else {
+            // point closure at interpreter stub
+            object ** args = static_cast<object **>(LEAN_ALLOCA(n->m_nargs * sizeof(object *))); // NOLINT
+            for (unsigned i = 0; i < n->m_nargs; i++) {
+                args[i] = (n->m_args[i] == IRRELEVANT_ARG ? value(box(0)) : fp[n->m_args[i]]).m_obj;
+            }
+            return mk_stub_closure(sym.m_decl, n->m_nargs, args);
+        }
+    }
+
+    __attribute__((noinline)) value ap_node(cnode const * n, value * fp) {
+        object ** args = static_cast<object **>(LEAN_ALLOCA(n->m_nargs * sizeof(object *))); // NOLINT
+        for (uint32_t i = 0; i < n->m_nargs; i++) {
+            args[i] = (n->m_args[i] == IRRELEVANT_ARG ? value(box(0)) : fp[n->m_args[i]]).m_obj;
+        }
+        return apply_n(fp[n->m_a].m_obj, n->m_nargs, args);
+    }
+
+    /** \brief Execute compiled code in the frame starting at `bp`; the arguments are already stored there. */
+    value run(ccode const * c, size_t bp) {
+        check_system();
+        m_arg_stack.resize(bp + c->m_frame_size);
+        value * fp = m_arg_stack.data() + bp;
+#define LEAN_IR_ARG(i) ((i) == IRRELEVANT_ARG ? value(box(0)) : fp[(i)])
+#define LEAN_IR_REFRESH() (fp = m_arg_stack.data() + bp)
+        cnode const * n = c->m_entry;
+        while (true) {
+            switch (n->m_kind) {
+            case ck::Ctor: {
+                object * o = alloc_cnstr(n->m_a, n->m_b, n->m_c);
+                for (uint32_t i = 0; i < n->m_nargs; i++) {
+                    cnstr_set(o, i, LEAN_IR_ARG(n->m_args[i]).m_obj);
+                }
+                fp[n->m_dst] = o;
+                n = n->m_next;
+                break;
+            }
+            case ck::ConstBox:
+                fp[n->m_dst] = n->m_lit;
+                n = n->m_next;
+                break;
+            case ck::Reset: {
+                object * o = fp[n->m_a].m_obj;
+                if (is_exclusive(o)) {
+                    for (uint32_t i = 0; i < n->m_b; i++) {
+                        cnstr_release(o, i);
+                    }
+                    fp[n->m_dst] = o;
+                } else {
+                    dec_ref(o);
+                    fp[n->m_dst] = box(0);
+                }
+                n = n->m_next;
+                break;
+            }
+            case ck::Reuse: {
+                object * o = fp[static_cast<uint32_t>(n->m_lit.m_num)].m_obj;
+                if (is_scalar(o)) {
+                    // fall back to regular allocation
+                    if (n->m_flag) {
+                        fp[n->m_dst] = box(n->m_a);
+                    } else {
+                        object * r = alloc_cnstr(n->m_a, n->m_b, n->m_c);
+                        for (uint32_t i = 0; i < n->m_nargs; i++) {
+                            cnstr_set(r, i, LEAN_IR_ARG(n->m_args[i]).m_obj);
+                        }
+                        fp[n->m_dst] = r;
+                    }
+                } else {
+                    // create new constructor object in-place
+                    if (reinterpret_cast<uintptr_t>(n->m_obj)) {
+                        cnstr_set_tag(o, n->m_a);
+                    }
+                    for (uint32_t i = 0; i < n->m_nargs; i++) {
+                        cnstr_set(o, i, LEAN_IR_ARG(n->m_args[i]).m_obj);
+                    }
+                    fp[n->m_dst] = o;
+                }
+                n = n->m_next;
+                break;
+            }
+            case ck::Proj:
+                fp[n->m_dst] = cnstr_get(fp[n->m_a].m_obj, n->m_b);
+                n = n->m_next;
+                break;
+            case ck::UProj:
+                fp[n->m_dst] = cnstr_get_usize(fp[n->m_a].m_obj, n->m_b);
+                n = n->m_next;
+                break;
+            case ck::SProj: {
+                object * o = fp[n->m_a].m_obj;
+                value v;
+                switch (n->m_ty) {
+                    case type::Float: v = value::from_float(cnstr_get_float(o, n->m_b)); break;
+                    case type::Float32: v = value::from_float32(cnstr_get_float32(o, n->m_b)); break;
+                    case type::UInt8: v = cnstr_get_uint8(o, n->m_b); break;
+                    case type::UInt16: v = cnstr_get_uint16(o, n->m_b); break;
+                    case type::UInt32: v = cnstr_get_uint32(o, n->m_b); break;
+                    case type::UInt64: v = cnstr_get_uint64(o, n->m_b); break;
+                    default: lean_unreachable();
+                }
+                fp[n->m_dst] = v;
+                n = n->m_next;
+                break;
+            }
+            case ck::Fap: {
+                symbol_cache_entry * s = n->m_sym;
+                if (LEAN_UNLIKELY(!s)) {
+                    s = &lookup_symbol_ref(n->m_fn);
+                    if (s->m_persistent) const_cast<cnode *>(n)->m_sym = s;
+                }
+                value r = call_node(*s, n, bp);
+                LEAN_IR_REFRESH();
+                fp[n->m_dst] = r;
+                n = n->m_next;
+                break;
+            }
+            case ck::FapSelfTail: {
+                // tail recursion! copy argument values to parameter slots and restart
+                // argument and parameter locations may overlap, so first copy arguments to the end of the stack
+                size_t old_size = m_arg_stack.size();
+                m_arg_stack.ensure(old_size + n->m_nargs);
+                LEAN_IR_REFRESH();
+                value * tmp = m_arg_stack.data() + old_size;
+                for (uint32_t i = 0; i < n->m_nargs; i++) {
+                    tmp[i] = LEAN_IR_ARG(n->m_args[i]);
+                }
+                for (uint32_t i = 0; i < n->m_nargs; i++) {
+                    fp[i] = tmp[i];
+                }
+                check_system();
+                n = c->m_entry;
+                break;
+            }
+            case ck::Const: {
+                value r = load(n->m_fn, n->m_ty);
+                LEAN_IR_REFRESH();
+                fp[n->m_dst] = r;
+                n = n->m_next;
+                break;
+            }
+            case ck::Pap:
+                fp[n->m_dst] = pap_node(n, fp);
+                n = n->m_next;
+                break;
+            case ck::Ap: {
+                value r = ap_node(n, fp);
+                LEAN_IR_REFRESH();
+                fp[n->m_dst] = r;
+                n = n->m_next;
+                break;
+            }
+            case ck::Box:
+                fp[n->m_dst] = box_t(fp[n->m_a].m_num, n->m_ty);
+                n = n->m_next;
+                break;
+            case ck::Unbox:
+                fp[n->m_dst] = unbox_t(fp[n->m_a].m_obj, n->m_ty);
+                n = n->m_next;
+                break;
+            case ck::LitObj:
+                inc(n->m_obj);
+                fp[n->m_dst] = n->m_obj;
+                n = n->m_next;
+                break;
+            case ck::LitNum:
+                fp[n->m_dst] = n->m_lit;
+                n = n->m_next;
+                break;
+            case ck::IsShared:
+                fp[n->m_dst] = !is_exclusive(fp[n->m_a].m_obj);
+                n = n->m_next;
+                break;
+            case ck::IsTagged:
+                fp[n->m_dst] = !is_scalar(fp[n->m_a].m_obj);
+                n = n->m_next;
+                break;
+            case ck::Set: {
+                object * o = fp[n->m_a].m_obj;
+                lean_assert(is_exclusive(o));
+                cnstr_set(o, n->m_b, LEAN_IR_ARG(n->m_c).m_obj);
+                n = n->m_next;
+                break;
+            }
+            case ck::SetTag: {
+                object * o = fp[n->m_a].m_obj;
+                lean_assert(is_exclusive(o));
+                cnstr_set_tag(o, n->m_b);
+                n = n->m_next;
+                break;
+            }
+            case ck::USet: {
+                object * o = fp[n->m_a].m_obj;
+                lean_assert(is_exclusive(o));
+                cnstr_set_usize(o, n->m_b, fp[n->m_c].m_num);
+                n = n->m_next;
+                break;
+            }
+            case ck::SSet: {
+                object * o = fp[n->m_a].m_obj;
+                value v = fp[n->m_c];
+                lean_assert(is_exclusive(o));
+                switch (n->m_ty) {
+                    case type::Float: cnstr_set_float(o, n->m_b, v.m_float); break;
+                    case type::Float32: cnstr_set_float32(o, n->m_b, v.m_float32); break;
+                    case type::UInt8: cnstr_set_uint8(o, n->m_b, v.m_num); break;
+                    case type::UInt16: cnstr_set_uint16(o, n->m_b, v.m_num); break;
+                    case type::UInt32: cnstr_set_uint32(o, n->m_b, v.m_num); break;
+                    case type::UInt64: cnstr_set_uint64(o, n->m_b, v.m_num); break;
+                    default: lean_unreachable();
+                }
+                n = n->m_next;
+                break;
+            }
+            case ck::Inc:
+                inc(fp[n->m_a].m_obj, n->m_b);
+                n = n->m_next;
+                break;
+            case ck::Dec:
+                for (uint32_t i = 0; i < n->m_b; i++) {
+                    dec(fp[n->m_a].m_obj);
+                }
+                n = n->m_next;
+                break;
+            case ck::Del:
+                lean_del_object(fp[n->m_a].m_obj);
+                n = n->m_next;
+                break;
+            case ck::Case: {
+                value v = fp[n->m_a];
+                unsigned tag = n->m_flag ? static_cast<unsigned>(v.m_num) : lean_obj_tag(v.m_obj);
+                cnode const * next = nullptr;
+                for (uint32_t i = 0; i < n->m_nalts; i++) {
+                    ccase_alt const & a = n->m_alts[i];
+                    if (a.m_default || a.m_tag == tag) {
+                        next = a.m_body;
+                        break;
+                    }
+                }
+                if (!next) throw exception("incomplete case");
+                n = next;
+                break;
+            }
+            case ck::Ret:
+                return LEAN_IR_ARG(n->m_a);
+            case ck::Jmp: {
+                cjp const * jp = n->m_jp;
+                for (uint32_t i = 0; i < n->m_nargs; i++) {
+                    fp[jp->m_params[i]] = LEAN_IR_ARG(n->m_args[i]);
+                }
+                n = jp->m_body;
+                break;
+            }
+            case ck::JDecl:
+                n = n->m_next;
+                break;
+            case ck::Unreachable:
+                throw exception("unreachable code");
+            }
+        }
+#undef LEAN_IR_ARG
+#undef LEAN_IR_REFRESH
+    }
+
     // closure stub
     object * stub_m(object ** args) {
         decl d(args[2]);
         size_t old_size = m_arg_stack.size();
         for (size_t i = 0; i < decl_params(d).size(); i++) {
             m_arg_stack.push_back(args[3 + i]);
+        }
+        if (ccode * code = get_code(d)) {
+            object * r = run(code, old_size).m_obj;
+            m_arg_stack.resize(old_size);
+            return r;
         }
         push_frame(d, old_size);
         object * r = eval_decl_body(d).m_obj;
@@ -1074,7 +1984,7 @@ public:
      *  * supports under- and over-application.
      *  * supports "calling" (evaluating) nullary constants. */
     object * call_boxed(name const & fn, unsigned n, object ** args) {
-        const symbol_cache_entry& e = lookup_symbol(fn);
+        symbol_cache_entry & e = lookup_symbol_ref(fn);
         unsigned arity = decl_params(e.m_decl).size();
         object * r;
         if (arity == 0) {
@@ -1143,7 +2053,7 @@ public:
                 object * o = io_result_get_value(r);
                 mark_persistent(o);
                 dec_ref(r);
-                const symbol_cache_entry& e = lookup_symbol(decl);
+                symbol_cache_entry & e = lookup_symbol_ref(decl);
                 if (e.m_native.m_addr) {
                     *((object **)e.m_native.m_addr) = o;
                 } else {
@@ -1158,6 +2068,10 @@ public:
         }
     }
 };
+
+void invalidate_ir_caches() {
+    g_ir_epoch.fetch_add(1, std::memory_order_acq_rel);
+}
 
 extern "C" object * lean_decl_get_sorry_dep(object * env, object * n);
 
@@ -1216,6 +2130,7 @@ extern "C" LEAN_EXPORT object * lean_run_init(object * env, object * opts, objec
 }
 
 void initialize_ir_interpreter() {
+    if (getenv("LEAN_IR_NO_COMPILE")) ir::g_ir_compile_enabled = false;
     ir::g_interpreter_prefer_native = new name({"interpreter", "prefer_native"});
     mark_persistent(ir::g_interpreter_prefer_native->raw());
     ir::g_init_globals = new name_hash_map<object *>();
