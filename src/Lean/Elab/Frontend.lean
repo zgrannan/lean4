@@ -137,6 +137,12 @@ def process (input : String) (env : Environment) (opts : Options) (fileName : Op
   let s ← IO.processCommands inputCtx { : Parser.ModuleParserState } (Command.mkState env {} opts)
   pure (s.commandState.env, s.commandState.messages)
 
+register_builtin_option lean.skipIlean : Bool := {
+  defValue := false
+  descr := "write `.ilean` files without references and declarations, which saves collecting them \
+    from the info trees; cross-module navigation in the editor then does not find this module"
+}
+
 /--
 Walks the snapshot tree, pairing each node's diagnostics with the syntax of the command that
 produced them.
@@ -392,9 +398,13 @@ def runFrontend
       writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts) env oleanFileName
 
   if let some ileanFileName := ileanFileName? then
-    let trees := snaps.getAll.flatMap (match ·.infoTree? with | some t => #[t] | _ => #[])
-    let references := Lean.Server.findModuleRefs inputCtx.fileMap trees (localVars := false)
-    let (moduleRefs, decls) ← references.toLspModuleRefs
+    let (moduleRefs, decls) ←
+      if lean.skipIlean.get finalOpts then
+        pure ({}, {})
+      else
+        let trees := snaps.getAll.flatMap (match ·.infoTree? with | some t => #[t] | _ => #[])
+        let references := Lean.Server.findModuleRefs inputCtx.fileMap trees (localVars := false)
+        references.toLspModuleRefs
     let ilean := {
       module        := mainModuleName
       directImports := Server.collectImports ⟨snap.stx⟩
