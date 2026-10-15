@@ -12,6 +12,8 @@ namespace lean {
 namespace ir {
 /** \brief Run `n` using the "boxed" ABI, i.e. with all-owned parameters. */
 object * run_boxed(elab_environment const & env, options const & opts, name const & fn, unsigned n, object **args);
+/** \brief Drop the interpreter's caches of imported declarations; to be called when compacted regions are loaded or freed. */
+LEAN_EXPORT void invalidate_ir_caches();
 LEAN_EXPORT uint32 run_main(elab_environment const & env, options const & opts, list_ref<string_ref> const & args);
 }
 void initialize_ir_interpreter();
