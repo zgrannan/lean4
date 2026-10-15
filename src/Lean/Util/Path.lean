@@ -51,6 +51,15 @@ where
   | Name.anonymous => base
   | Name.num _ _ => panic! "ill-formed import"
 
+private def appendModPath (acc : String) : Name → String
+  | Name.str p h => (appendModPath acc p).push FilePath.pathSeparator |>.append h
+  | Name.anonymous => acc
+  | Name.num _ _ => panic! "ill-formed import"
+
+/-- The path of `mod` below `base`, without an extension. -/
+def modToPathStem (base : FilePath) (mod : Name) : String :=
+  appendModPath base.toString mod
+
 /-- A `.olean' search path. -/
 abbrev SearchPath := System.SearchPath
 
