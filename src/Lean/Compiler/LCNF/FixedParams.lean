@@ -52,6 +52,8 @@ structure Context where
   Remark: `main` is in `decls`.
   -/
   main : Decl .pure
+  /-- The declarations in `decls` by name. -/
+  declMap : Std.HashMap Name (Decl .pure)
   /--
   The assignment maps free variable ids in the current code being analyzed to abstract values.
   We only track the abstract value assigned to parameters.
@@ -92,7 +94,7 @@ def evalArg (arg : Arg .pure) : FixParamM AbsValue := do
   | .fvar fvarId => evalFVar fvarId
 
 def inMutualBlock (declName : Name) : FixParamM Bool :=
-  return (← read).decls.any (·.name == declName)
+  return (← read).declMap.contains declName
 
 def mkAssignment (decl : Decl .pure) (values : Array AbsValue) : FVarIdMap AbsValue := Id.run do
   let mut assignment := {}
@@ -153,21 +155,20 @@ partial def evalApp (declName : Name) (args : Array (Arg .pure)) : FixParamM Uni
         modify fun s => { s with fixed := s.fixed.set! i false }
     unless (← get).fixed.contains true do
       throw () -- stop analysis, none of the arguments are fixed.
-  for decl in (← read).decls do
-    if declName == decl.name then
-      -- Call to another function in the same mutual block.
-      let mut values := #[]
-      for i in *...decl.params.size do
-        if h : i < args.size then
-          values := values.push (← evalArg args[i])
-        else
-          values := values.push .top
-      let key := (declName, values)
-      unless (← get).visited.contains key do
-        modify fun s => { s with visited := s.visited.insert key }
-        decl.value.forCodeM fun c =>
-          let assignment := mkAssignment decl values
-          withReader (fun ctx => { ctx with assignment }) <| evalCode c
+  if let some decl := (← read).declMap[declName]? then
+    -- Call to another function in the same mutual block.
+    let mut values := #[]
+    for i in *...decl.params.size do
+      if h : i < args.size then
+        values := values.push (← evalArg args[i])
+      else
+        values := values.push .top
+    let key := (declName, values)
+    unless (← get).visited.contains key do
+      modify fun s => { s with visited := s.visited.insert key }
+      decl.value.forCodeM fun c =>
+        let assignment := mkAssignment decl values
+        withReader (fun ctx => { ctx with assignment }) <| evalCode c
 
 end
 
@@ -193,13 +194,14 @@ contains all (computationally relevant) functions in the mutual block.
 -/
 def mkFixedParamsMap (decls : Array (Decl .pure)) : NameMap (Array Bool) := Id.run do
   let mut result := {}
+  let declMap := decls.foldl (init := {}) fun m decl => m.insert decl.name decl
   for decl in decls do
     let values := mkInitialValues decl.params.size
     let assignment := mkAssignment decl values
     let fixed := Array.replicate decl.params.size true
     match decl.value with
     | .code c =>
-      match evalCode c |>.run { main := decl, decls, assignment } |>.run { fixed } with
+      match evalCode c |>.run { main := decl, decls, declMap, assignment } |>.run { fixed } with
       | .ok _ s | .error _ s => result := result.insert decl.name s.fixed
     | .extern .. =>
       result := result.insert decl.name fixed
