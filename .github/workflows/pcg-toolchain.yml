@@ -1,0 +1,73 @@
+name: PCG toolchain
+
+# Builds the Lean toolchain used by the `pcg-docs` CI and publishes it as a workflow artifact.
+# `pcg-docs` pins the commit of this branch in `formalization/pcg-lean-rev` and downloads the
+# artifact of the run that built that commit (see `scripts/fetch_pcg_lean.py` there).
+
+on:
+  push:
+    branches:
+      - pcg-optimized
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TOOLCHAIN: lean-pcg-linux_aarch64
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ccache libgmp-dev libuv1-dev libssl-dev pkgconf zstd
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ github.sha }}
+          restore-keys: ccache-
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release -DSTRIP_BINARIES=ON -DWFAIL=OFF \
+            -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
+            -DLEAN_EXTRA_CXX_FLAGS=-march=armv8.2-a -DLEANC_EXTRA_CC_FLAGS=-march=armv8.2-a
+
+      - name: Build
+        run: make -C build -j"$(nproc)"
+
+      - name: Install
+        run: |
+          cmake --install build/stage1 --prefix "$PWD/dist/$TOOLCHAIN"
+          # `libleanshared.so` needs libuv at run time and executables built by `leanc` link it
+          cp -L /usr/lib/aarch64-linux-gnu/libuv.so.1 "dist/$TOOLCHAIN/lib/lean/"
+          cp /usr/lib/aarch64-linux-gnu/libuv.a "dist/$TOOLCHAIN/lib/lean/"
+
+      - name: Smoke test
+        run: |
+          export PATH="$PWD/dist/$TOOLCHAIN/bin:$PATH"
+          lean --version
+          lake --version
+          printf 'def x : Nat := 1\n#eval x + 1\ntheorem t : x = 1 := rfl\n' > /tmp/smoke.lean
+          lean /tmp/smoke.lean
+
+      - name: Package
+        run: tar --zstd -C dist -cf "$TOOLCHAIN.tar.zst" "$TOOLCHAIN"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pcg-lean-linux_aarch64
+          path: ${{ env.TOOLCHAIN }}.tar.zst
+          compression-level: 0
+          retention-days: 90
+          if-no-files-found: error
