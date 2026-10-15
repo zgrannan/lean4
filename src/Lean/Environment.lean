@@ -2056,6 +2056,8 @@ private def ImportedModule.irData? (self : ImportedModule) (loadIRSig : Bool := 
 structure ImportState where
   private moduleNameMap : Std.HashMap Name ImportedModule := {}
   private moduleNames   : Array Name := #[]
+  /-- Search path entry that provides each root package seen so far. -/
+  private rootDirs      : Std.HashMap String System.FilePath := {}
 deriving Inhabited
 
 /-- Bumps all modules' `isExported` flag to true, intended for use in `shake` only. -/
@@ -2076,33 +2078,50 @@ abbrev ImportStateM := StateRefT ImportState IO
 @[inline] nonrec def ImportStateM.run (x : ImportStateM α) (s : ImportState := default) : IO (α × ImportState) :=
   x.run s
 
-private def readModuleDataPartsOfMod (mod : Name) : IO (Array (ModuleData × CompactedRegion)) := do
-  let mFile ← findOLean mod
-  unless (← mFile.pathExists) do
-    throw <| IO.userError s!"object file '{mFile}' of module {mod} does not exist"
-  let main ← unsafe CompactedRegion.read (α := ModuleData) mFile #[]
+/-- Finds the search path entry that provides `mod`'s package, probing the file system once per package. -/
+private def findRootDirCached (mod : Name) : ImportStateM System.FilePath := do
+  let pkg := mod.getRoot.toString (escape := false)
+  if let some root := (← get).rootDirs[pkg]? then
+    return root
+  let some root ← (← searchPathRef.get).findRootDir? "olean" pkg
+    | discard <| findOLean mod
+      throw <| IO.userError s!"unknown module prefix '{pkg}'"
+  modify fun s => { s with rootDirs := s.rootDirs.insert pkg root }
+  return root
+
+private unsafe def readPartOrExplain (mod : Name) (fname : System.FilePath)
+    (depRegions : Array CompactedRegion) : IO (ModuleData × CompactedRegion) := do
+  try
+    CompactedRegion.read (α := ModuleData) fname depRegions
+  catch e =>
+    unless (← fname.pathExists) do
+      throw <| IO.userError s!"object file '{fname}' of module {mod} does not exist"
+    throw e
+
+private def readModuleDataPartsOfMod (mod : Name) : ImportStateM (Array (ModuleData × CompactedRegion)) := do
+  let stem := modToPathStem (← findRootDirCached mod) mod
+  let main ← unsafe readPartOrExplain mod ⟨stem ++ ".olean"⟩ #[]
   if !main.1.isModule then
     return #[main]
   -- Opportunistically load all available parts.
   -- Necessary because the import level may be upgraded a later import.
-  let sFile := OLeanLevel.server.adjustFileName mFile
-  let server ← unsafe CompactedRegion.read (α := ModuleData) sFile #[main.2]
-  let pFile := OLeanLevel.private.adjustFileName mFile
-  let priv ← unsafe CompactedRegion.read (α := ModuleData) pFile #[main.2, server.2]
+  let server ← unsafe CompactedRegion.read (α := ModuleData) ⟨stem ++ ".olean.server"⟩ #[main.2]
+  let priv ← unsafe CompactedRegion.read (α := ModuleData) ⟨stem ++ ".olean.private"⟩ #[main.2, server.2]
   return #[main, server, priv]
 
-private def readIRPartsOfMod (mod : Name) : IO (Array (ModuleData × CompactedRegion)) := do
-  let mFile ← findOLean mod
-  let irSigFile := mFile.withExtension "ir.sig"
+private def readIRPartsOfMod (mod : Name) : ImportStateM (Array (ModuleData × CompactedRegion)) := do
+  let stem := modToPathStem (← findRootDirCached mod) mod
   -- TODO: we don't (necessarily) know whether the module is a `module` or not, but file existence
   -- checks are not great in the face of module-ness changes
-  unless (← irSigFile.pathExists) do
-    return #[]
-  let irSig ← unsafe CompactedRegion.read (α := ModuleData) irSigFile #[]
+  let irSigFile : System.FilePath := ⟨stem ++ ".ir.sig"⟩
+  let irSig ← try unsafe CompactedRegion.read (α := ModuleData) irSigFile #[]
+    catch e =>
+      unless (← irSigFile.pathExists) do
+        return #[]
+      throw e
   -- Opportunistically load all available parts.
   -- Necessary because the import level may be upgraded a later import.
-  let irFile := mFile.withExtension "ir"
-  let ir ← unsafe CompactedRegion.read (α := ModuleData) irFile #[irSig.2]
+  let ir ← unsafe CompactedRegion.read (α := ModuleData) ⟨stem ++ ".ir"⟩ #[irSig.2]
   return #[irSig, ir]
 
 partial def importModulesCore

@@ -50,18 +50,30 @@ where
   | Name.anonymous => base
   | Name.num _ _ => panic! "ill-formed import"
 
+private def appendModPath (acc : String) : Name → String
+  | Name.str p h => (appendModPath acc p).push FilePath.pathSeparator |>.append h
+  | Name.anonymous => acc
+  | Name.num _ _ => panic! "ill-formed import"
+
+/-- The path of `mod` below `base`, without an extension. -/
+def modToPathStem (base : FilePath) (mod : Name) : String :=
+  appendModPath base.toString mod
+
 /-- A `.olean' search path. -/
 abbrev SearchPath := System.SearchPath
 
 namespace SearchPath
+
+/-- The first entry of `sp` that contains the package `pkg` (as a directory or as `pkg.ext`). -/
+def findRootDir? (sp : SearchPath) (ext : String) (pkg : String) : IO (Option FilePath) :=
+  sp.findM? fun p => (p / pkg).isDir <||> ((p / pkg).addExtension ext).pathExists
 
 /-- If the package of `mod` can be found in `sp`, return the path with extension
 `ext` (`lean` or `olean`) corresponding to `mod`. Otherwise, return `none`. Does
 not check whether the returned path exists. -/
 def findWithExt (sp : SearchPath) (ext : String) (mod : Name) : IO (Option FilePath) := do
   let pkg := mod.getRoot.toString (escape := false)
-  let root? ← sp.findM? fun p =>
-    (p / pkg).isDir <||> ((p / pkg).addExtension ext).pathExists
+  let root? ← sp.findRootDir? ext pkg
   return root?.map (modToFilePath · mod ext)
 
 /-- Like `findWithExt`, but ensures the returned path exists. -/
