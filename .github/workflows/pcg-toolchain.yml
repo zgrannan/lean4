@@ -78,10 +78,11 @@ jobs:
           lean /tmp/smoke.lean
           # no flag may name a library of this machine
           if leanc --print-ldflags | tr ' ' '\n' | grep '^/usr/'; then exit 1; fi
-          printf 'def main : IO Unit := IO.println s!"{(2 : Nat) ^ 100}"\n' > /tmp/Main.lean
-          lean /tmp/Main.lean -c /tmp/main.c
-          leanc /tmp/main.c -o /tmp/hello
-          /tmp/hello
+          mkdir /tmp/hello && cd /tmp/hello
+          printf 'def main : IO Unit := IO.println s!"{(2 : Nat) ^ 100}"\n' > Main.lean
+          lean Main.lean -c main.c
+          leanc main.c -o hello
+          ./hello
 
       - name: Package
         # a plain tar: the artifact upload compresses it, and the consumer needs nothing but Python
