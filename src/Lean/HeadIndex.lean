@@ -111,5 +111,33 @@ def toHeadIndex (e : Expr) : HeadIndex :=
   | some i => i
   | none => toHeadIndexSlow e
 
+/--
+Result of comparing the head of an expression with a `HeadIndex` as in `toHeadIndexQuick?`:
+`0` if they differ, `1` if they agree, and `2` if the quick version fails.
+-/
+private def headIndexQuickEq (h : HeadIndex) : Expr → UInt8
+  | mvar mvarId             => match h with | .mvar m => if m == mvarId then 1 else 0 | _ => 0
+  | fvar fvarId             => match h with | .fvar f => if f == fvarId then 1 else 0 | _ => 0
+  | const constName _       => match h with | .const n => if n == constName then 1 else 0 | _ => 0
+  | proj structName idx _   =>
+    match h with | .proj s i => if s == structName && i == idx then 1 else 0 | _ => 0
+  | sort _                  => match h with | .sort => 1 | _ => 0
+  | lam ..                  => match h with | .lam => 1 | _ => 0
+  | forallE ..              => match h with | .forallE => 1 | _ => 0
+  | lit v                   => match h with | .lit l => if l == v then 1 else 0 | _ => 0
+  | app f _                 => headIndexQuickEq h f
+  | letE _ _ _ b _          => headIndexQuickEq h b
+  | mdata _ e               => headIndexQuickEq h e
+  | _                       => 2
+
+/--
+`e.toHeadIndex == h`, without allocating the `HeadIndex` of `e` when the quick version succeeds.
+-/
+def hasHeadIndex (e : Expr) (h : HeadIndex) : Bool :=
+  match headIndexQuickEq h e with
+  | 0 => false
+  | 1 => true
+  | _ => toHeadIndexSlow e == h
+
 end Expr
 end Lean
