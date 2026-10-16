@@ -23,7 +23,7 @@ byte for byte, apart from the githash in the `.olean` header, over all 1306 modu
 Callgrind instruction counts (`valgrind --tool=callgrind`, one `lean` invocation per module as Lake
 runs it, imports and options from the module's `.setup.json`):
 
-| Module | v4.35.0 (gcc build) | `pcg-optimized` + PGO |
+| Module | v4.35.0 (gcc build) | `pcg-optimized` + PGO (local build) |
 | --- | --- | --- |
 | `MIR.SwitchInt` (import dominated) | 1.760 G | 1.299 G (−26%) |
 | `Core.Doc.Interp.Resolve` | 9.555 G | 8.470 G (−11%) |
@@ -36,6 +36,11 @@ The official toolchain (clang) executes about 4% fewer instructions than the unm
 Clean `lake build Runtime Core Export MIR PCG OpSem Properties Presentation Frame SubView Spec`
 (1447 jobs, 32 cores, dependencies prebuilt): official toolchain 253 s, 291 s, 305 s; this
 toolchain 183 s, 170 s, 166 s.
+
+The toolchain that the workflow builds (GCC 13, aarch64) executes 4-6% fewer instructions with the
+profile than without it, and uses 8-10% less user CPU time (minimum of five runs):
+`PCG.Owned.OwnedState` 2.14 s to 1.93 s, `Core.Dsl.DefCoe` 3.22 s to 2.95 s,
+`Core.Doc.Interp.Resolve` 1.33 s to 1.20 s. The local PGO build above (GCC 15) saves 13-17%.
 
 ## Builds
 
