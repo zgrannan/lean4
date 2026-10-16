@@ -46,7 +46,7 @@ def kabstract (e : Expr) (p : Expr) (occs : Occurrences := .all) : MetaM Expr :=
         | e                => return e
       if e.hasLooseBVars then
         visitChildren ()
-      else if e.toHeadIndex != pHeadIdx || e.headNumArgs != pNumArgs then
+      else if !e.hasHeadIndex pHeadIdx || e.headNumArgs != pNumArgs then
         visitChildren ()
       else
         -- We save the metavariable context here,
