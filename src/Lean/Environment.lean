@@ -484,11 +484,37 @@ private def AsyncConsts.add (aconsts : AsyncConsts) (aconst : AsyncConst) : Asyn
 private def AsyncConsts.find? (aconsts : AsyncConsts) (declName : Name) : Option AsyncConst :=
   aconsts.map.find? declName
 
+/--
+`NameTrie.findLongestPrefix?` without allocating the list of the name's components, which is
+expensive for the many lookups that fail at the first component. As the components of a name are
+stored starting from the last one, the `i`-th component from the root is found by climbing
+`size - 1 - i` times.
+-/
+private partial def findLongestNamePrefix? (t : PrefixTreeNode NamePart AsyncConst NamePart.cmp)
+    (n : Name) : Option AsyncConst :=
+  loop none t 0
+where
+  size := n.getNumParts
+  climb : Name → Nat → Name
+    | n, 0 => n
+    | n, k + 1 => climb n.getPrefix k
+  part (i : Nat) : NamePart :=
+    match climb n (size - 1 - i) with
+    | .str _ s => .str s
+    | .num _ k => .num k
+    | .anonymous => panic! "unreachable"
+  loop (acc? : Option AsyncConst) : PrefixTreeNode NamePart AsyncConst NamePart.cmp → Nat →
+      Option AsyncConst
+    | .Node val m, i =>
+      if i == size then val <|> acc?
+      else match m.get? (part i) with
+        | none => val
+        | some t => loop (val <|> acc?) t (i + 1)
+
 /-- Finds the constant in the collection that is a prefix of `declName`, if any. -/
 private def AsyncConsts.findPrefix? (aconsts : AsyncConsts) (declName : Name) : Option AsyncConst :=
-  -- as macro scopes are a strict suffix, we do not have to remove them before calling
-  -- `findLongestPrefix?`
-  aconsts.normalizedTrie.findLongestPrefix? (privateToUserName declName)
+  -- as macro scopes are a strict suffix, we do not have to remove them before searching
+  findLongestNamePrefix? aconsts.normalizedTrie.val (privateToUserName declName)
 
 /--
 Finds constants including from other environment branches by recursively looking up longest
