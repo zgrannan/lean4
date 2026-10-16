@@ -13,7 +13,7 @@ byte for byte, apart from the githash in the `.olean` header, over all 1306 modu
 | `IO.appPath` uses the `readlink` length | The result was not NUL-terminated; under valgrind it contained stale bytes and broke every file that compiles a definition. |
 | Import resolves the search path entry once per root package | Importing probed every search path entry for every module (about 40k failing `stat` calls per process, which also serialize on directory locks when many `lean` processes run). |
 | `lean_mark_persistent` / `lean_mark_mt` skip scalars and persistent objects before the worklist | Fewer worklist operations during import. |
-| Compiled form for persistent IR declarations in the interpreter | Imported IR is decoded once per thread; callees, constants and partial applications are resolved once. `LEAN_IR_NO_COMPILE=1` disables it, `LEAN_IR_COMPILE_THRESHOLD=n` compiles on the n-th call. |
+| Compiled form for persistent IR declarations in the interpreter | Imported IR is decoded once per thread; callees and partial applications are resolved once. The values of constants stay per interpreter, because a constant can be a closure over the interpreter's environment. `LEAN_IR_NO_COMPILE=1` disables it, `LEAN_IR_COMPILE_THRESHOLD=n` compiles on the n-th call. |
 | `FixedParams` finds the mutual block of a call by hash | The analysis scanned every declaration of the block for every application. |
 | `replace_rec_fn` takes the callback as a template parameter and uses an open-addressing cache | `instantiate`, `abstract`, ... no longer go through `std::function` and `std::unordered_map`. |
 | `lean.skipIlean` (opt-in) | Writes `.ilean` files without references and declarations. |
@@ -41,10 +41,19 @@ Clean `lake build Runtime Core Export MIR PCG OpSem Properties Presentation Fram
 (1447 jobs, 32 cores, dependencies prebuilt): official toolchain 253 s, 291 s, 305 s; this
 toolchain 183 s, 170 s, 166 s.
 
+## Builds
+
+The `PCG toolchain` workflow (`.github/workflows/pcg-toolchain.yml`) builds the toolchain with GCC for
+aarch64 (`-march=armv8.2-a`) and x86_64 Linux on every push to this branch and publishes it as the
+artifact `pcg-lean-linux_<arch>`. It builds with `LEAN_STANDALONE=ON` and the linker flags of the official
+Linux builds, and bundles the static libraries (`libgmp.a`, `libssl.a`, `libcrypto.a`, `libuv.a`) in
+`lib/lean`, so that `leanc` links executables on machines without development packages; a smoke test
+links and runs an executable. The workflow does not use profile-guided optimization, which `script/pcg_pgo.sh`
+adds for local builds (about 8% fewer instructions).
+
 ## Caveats
 
-- aarch64 only, and the PGO build requires a CPU with the ARMv8.2 extensions.
+- The PGO build requires a CPU with the ARMv8.2 extensions and is built for aarch64 only.
 - Built with GCC rather than the clang used for releases; the profile is only valid for the
   sources and flags it was recorded with.
-- A toolchain installed with `cmake --install` needs `libuv.so.1` (runtime) and `libuv.a` (linking
-  executables) next to `lib/lean` when libuv is not a system library.
+- `leanc` compiles with the system C compiler (`cc`), because the toolchain does not bundle clang.
