@@ -3,15 +3,26 @@ name: PCG toolchain
 # Builds the Lean toolchain used by the `pcg-docs` CI and publishes it as a workflow artifact.
 # `pcg-docs` pins the commit of this branch in `formalization/pcg-lean-rev` and downloads the
 # artifact of the run that built that commit (see `scripts/fetch_pcg_lean.py` there).
+#
+# The compiler is built with GCC profile-guided optimization when `script/pgo/profile-<arch>.tar.xz`
+# exists. A dispatch with `pgo: instrument` builds the instrumented compiler instead; the profile
+# is recorded by running it over the project (the `Lean PGO profile` workflow of `pcg-docs`) and
+# committed with `script/pgo/profile-rev` naming the commit that was instrumented.
 
 on:
   push:
     branches:
       - pcg-optimized
   workflow_dispatch:
+    inputs:
+      pgo:
+        description: "instrument: publish the instrumented compiler that records a profile"
+        type: choice
+        options: [auto, instrument]
+        default: auto
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.pgo }}
   cancel-in-progress: true
 
 jobs:
@@ -32,8 +43,22 @@ jobs:
     timeout-minutes: 300
     env:
       TOOLCHAIN: lean-pcg-linux_${{ matrix.arch }}
+      # the profile names the object files by their absolute path, which must be the same in the
+      # instrumented and the profile-guided build
+      GCDA: ${{ github.workspace }}/pgo-gcda
     steps:
       - uses: actions/checkout@v4
+
+      - name: Select the optimization mode
+        run: |
+          profile=script/pgo/profile-${{ matrix.arch }}.tar.xz
+          if [ "${{ inputs.pgo }}" = instrument ]; then
+            echo "PGO_MODE=instrument" >> "$GITHUB_ENV"
+          elif [ -f "$profile" ]; then
+            echo "PGO_MODE=use" >> "$GITHUB_ENV"
+          else
+            echo "PGO_MODE=plain" >> "$GITHUB_ENV"
+          fi
 
       - name: Install build dependencies
         run: |
@@ -44,17 +69,49 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/ccache
-          key: ccache-${{ matrix.arch }}-${{ github.sha }}
-          restore-keys: ccache-${{ matrix.arch }}-
+          key: ccache-${{ matrix.arch }}-${{ inputs.pgo }}-${{ hashFiles('script/pgo/profile-*') }}-${{ github.sha }}
+          restore-keys: ccache-${{ matrix.arch }}-${{ inputs.pgo }}-${{ hashFiles('script/pgo/profile-*') }}-
+
+      - name: Unpack the profile
+        if: env.PGO_MODE == 'use'
+        run: |
+          mkdir -p "$GCDA"
+          tar -C "$GCDA" -xJf script/pgo/profile-${{ matrix.arch }}.tar.xz
+          # the profile only matches objects that are compiled in the directory it was recorded in
+          mangled=${PWD//\//#}#build#
+          if ! find "$GCDA" -name '*.gcda' | grep -qF -e "$mangled" -e "$PWD/build/"; then
+            echo "::error::the profile was not recorded in $PWD/build"
+            exit 1
+          fi
+
+      - name: Check that the profile matches the sources
+        if: env.PGO_MODE == 'use'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rev=$(tr -d '[:space:]' < script/pgo/profile-rev)
+          changed=$(gh api "repos/$GITHUB_REPOSITORY/compare/$rev...$GITHUB_SHA" --paginate \
+            --jq '.files[].filename' | grep '^src/' || true)
+          if [ -n "$changed" ]; then
+            echo "::warning::sources changed since the profile was recorded at $rev; record it again: $(echo $changed | head -c 400)"
+          fi
 
       - name: Configure
         run: |
+          source script/pcg_pgo_flags.sh
+          ldflags="-Wl,--as-needed -lgmp -luv -lssl -lcrypto -lpthread -ldl -lrt -Wl,--no-as-needed"
+          case "$PGO_MODE" in
+            instrument) flags=$(pgo_flags generate "$GCDA" "${{ matrix.march }}")
+                        ldflags="$ldflags -fprofile-generate" ;;
+            use)        flags=$(pgo_flags use "$GCDA" "${{ matrix.march }}") ;;
+            plain)      flags="${{ matrix.march }}" ;;
+          esac
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release -DSTRIP_BINARIES=ON -DWFAIL=OFF \
             -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
             -DLEAN_STANDALONE=ON \
-            "-DLEAN_EXTRA_LINKER_FLAGS=-Wl,--as-needed -lgmp -luv -lssl -lcrypto -lpthread -ldl -lrt -Wl,--no-as-needed" \
-            -DLEAN_EXTRA_CXX_FLAGS="${{ matrix.march }}" -DLEANC_EXTRA_CC_FLAGS="${{ matrix.march }}"
+            "-DLEAN_EXTRA_LINKER_FLAGS=$ldflags" \
+            "-DLEAN_EXTRA_CXX_FLAGS=$flags" "-DLEANC_EXTRA_CC_FLAGS=$flags"
 
       - name: Build
         run: make -C build -j"$(nproc)"
@@ -71,6 +128,8 @@ jobs:
 
       - name: Smoke test
         run: |
+          # an instrumented compiler writes its counters at exit
+          export GCOV_PREFIX="$RUNNER_TEMP/smoke-gcda"
           export PATH="$PWD/dist/$TOOLCHAIN/bin:$PATH"
           lean --version
           lake --version
@@ -90,8 +149,8 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: pcg-lean-linux_${{ matrix.arch }}
+          name: ${{ env.PGO_MODE == 'instrument' && 'pcg-lean-pgo-instrumented' || 'pcg-lean-linux' }}_${{ matrix.arch }}
           path: ${{ env.TOOLCHAIN }}.tar
           compression-level: 6
-          retention-days: 90
+          retention-days: ${{ env.PGO_MODE == 'instrument' && 14 || 90 }}
           if-no-files-found: error
