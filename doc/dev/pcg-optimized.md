@@ -18,10 +18,6 @@ byte for byte, apart from the githash in the `.olean` header, over all 1306 modu
 | `replace_rec_fn` takes the callback as a template parameter and uses an open-addressing cache | `instantiate`, `abstract`, ... no longer go through `std::function` and `std::unordered_map`. |
 | `lean.skipIlean` (opt-in) | Writes `.ilean` files without references and declarations. |
 
-`script/pcg_pgo.sh` builds the compiler with GCC profile-guided optimization. The release used
-`-march=armv8.2-a` (inline LSE atomics) for both builds and a training run over 118 project modules
-that exclude the five benchmark modules.
-
 ## Measurements
 
 Callgrind instruction counts (`valgrind --tool=callgrind`, one `lean` invocation per module as Lake
@@ -48,12 +44,29 @@ aarch64 (`-march=armv8.2-a`) and x86_64 Linux on every push to this branch and p
 artifact `pcg-lean-linux_<arch>`. It builds with `LEAN_STANDALONE=ON` and the linker flags of the official
 Linux builds, and bundles the static libraries (`libgmp.a`, `libssl.a`, `libcrypto.a`, `libuv.a`) in
 `lib/lean`, so that `leanc` links executables on machines without development packages; a smoke test
-links and runs an executable. The workflow does not use profile-guided optimization, which `script/pcg_pgo.sh`
-adds for local builds (about 8% fewer instructions).
+links and runs an executable.
+
+The compiler is built with profile-guided optimization (`-fprofile-use`) from
+`script/pgo/profile-<arch>.tar.xz`. The profile names every object file by its absolute path, which
+is why the instrumented and the final build both run in `$GITHUB_WORKSPACE/build`. To record a new
+profile after changing the sources in `src/`:
+
+1. Dispatch `PCG toolchain` with `pgo: instrument`; it publishes the instrumented compiler as
+   `pcg-lean-pgo-instrumented_<arch>`.
+2. Dispatch the `Lean PGO profile` workflow of `pcg-docs` (private, which is why the training does not
+   run here) with that commit. It runs the instrumented compiler over the modules in
+   `formalization/scripts/pgo-train-modules.txt` on a runner of each architecture and publishes
+   `pgo-profile_<arch>`.
+3. Commit the two files as `script/pgo/profile-<arch>.tar.xz` and the instrumented commit as
+   `script/pgo/profile-rev`.
+
+A profile that does not match the sources of a function is ignored for that function, so a stale
+profile only loses speed; the workflow warns when `src/` changed since `profile-rev`.
+`script/pcg_pgo.sh` builds the same way on one machine.
 
 ## Caveats
 
-- The PGO build requires a CPU with the ARMv8.2 extensions and is built for aarch64 only.
+- The aarch64 build requires a CPU with the ARMv8.2 extensions.
 - Built with GCC rather than the clang used for releases; the profile is only valid for the
   sources and flags it was recorded with.
 - `leanc` compiles with the system C compiler (`cc`), because the toolchain does not bundle clang.
