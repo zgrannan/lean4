@@ -99,8 +99,6 @@ bool has_univ_mvar_core(expr const & e) { return lean_expr_has_level_mvar(e.to_o
 extern "C" uint8 lean_expr_has_level_param(obj_arg e);
 bool has_univ_param(expr const & e) { return lean_expr_has_level_param(e.to_obj_arg()); }
 
-extern "C" unsigned lean_expr_loose_bvar_range(object * e);
-unsigned get_loose_bvar_range(expr const & e) { return lean_expr_loose_bvar_range(e.to_obj_arg()); }
 
 extern "C" LEAN_EXPORT uint64_t lean_expr_mk_data(uint64_t hash, object * bvarRange, uint32_t approxDepth, uint8_t hasFVar, uint8_t hasExprMVar, uint8_t hasLevelMVar, uint8_t hasLevelParam) {
     if (approxDepth > 255) approxDepth = 255;
@@ -418,7 +416,7 @@ expr lower_loose_bvars(expr const & e, unsigned s, unsigned d) {
     if (d == 0 || s >= get_loose_bvar_range(e))
         return e;
     lean_assert(s >= d);
-    return replace(e, [=](expr const & e, unsigned offset) -> optional<expr> {
+    return replace_cheap(e, [=](expr const & e, unsigned offset) -> optional<expr> {
             unsigned s1 = s + offset;
             if (s1 < s)
                 return some_expr(e); // overflow, vidx can't be >= max unsigned
@@ -448,7 +446,7 @@ extern "C" LEAN_EXPORT object * lean_expr_lower_loose_bvars(b_obj_arg e, b_obj_a
 expr lift_loose_bvars(expr const & e, unsigned s, unsigned d) {
     if (d == 0 || s >= get_loose_bvar_range(e))
         return e;
-    return replace(e, [=](expr const & e, unsigned offset) -> optional<expr> {
+    return replace_cheap(e, [=](expr const & e, unsigned offset) -> optional<expr> {
             unsigned s1 = s + offset;
             if (s1 < s)
                 return some_expr(e); // overflow, vidx can't be >= max unsigned

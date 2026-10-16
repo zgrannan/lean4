@@ -15,7 +15,7 @@ expr abstract(expr const & e, unsigned n, expr const * subst) {
     lean_assert(std::all_of(subst, subst+n, [](expr const & e) { return !has_loose_bvars(e) && is_fvar(e); }));
     if (!has_fvar(e))
         return e;
-    return replace(e, [=](expr const & m, unsigned offset) -> optional<expr> {
+    return replace_cheap(e, [=](expr const & m, unsigned offset) -> optional<expr> {
             if (!has_fvar(m))
                 return some_expr(m); // expression m does not contain free variables
             if (is_fvar(m)) {
@@ -43,7 +43,7 @@ static object * lean_expr_abstract_core(object * e0, size_t n, object * subst) {
         lean_inc(e0);
         return e0;
     }
-    expr r = replace(e, [=](expr const & m, unsigned offset) -> optional<expr> {
+    expr r = replace_cheap(e, [=](expr const & m, unsigned offset) -> optional<expr> {
             if (!has_fvar(m) && !has_mvar(m))
                 return some_expr(m); // expression m does not contain free/meta variables
             bool fv = is_fvar(m);

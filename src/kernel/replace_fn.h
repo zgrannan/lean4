@@ -94,8 +94,10 @@ public:
     }
 };
 
-/* The functor type is a template parameter so that the callback can be inlined; see `replace`. */
-template<typename F>
+/* The functor type is a template parameter so that the callback can be inlined; see `replace`.
+   With `Cheap`, the callback takes constant time on the subterms it returns unchanged and returns
+   such a subterm itself; the cache is then neither consulted nor filled for those and for leaves. */
+template<typename F, bool Cheap = false>
 class replace_rec_fn_t {
     replace_cache m_cache;
     F const &     m_f;
@@ -107,14 +109,34 @@ class replace_rec_fn_t {
         return r;
     }
 
+    static bool is_leaf(expr const & e) {
+        switch (e.kind()) {
+        case expr_kind::Const: case expr_kind::Sort: case expr_kind::BVar:
+        case expr_kind::Lit:   case expr_kind::MVar: case expr_kind::FVar:
+            return true;
+        default:
+            return false;
+        }
+    }
+
     expr apply(expr const & e, unsigned offset) {
         bool shared = false;
+        optional<expr> r;
+        if constexpr (Cheap) {
+            r = m_f(e, offset);
+            if (r) {
+                if (r->raw() == e.raw()) return std::move(*r);
+            } else if (is_leaf(e)) {
+                return e;
+            }
+        }
         if (m_use_cache && !is_likely_unshared(e)) {
-            if (lean_object * r = m_cache.find(e.raw(), offset))
-                return expr(r, true);
+            if (lean_object * c = m_cache.find(e.raw(), offset))
+                return expr(c, true);
             shared = true;
         }
-        if (optional<expr> r = m_f(e, offset)) {
+        if constexpr (!Cheap) r = m_f(e, offset);
+        if (r) {
             return save_result(e, offset, std::move(*r), shared);
         } else {
             switch (e.kind()) {
@@ -154,6 +176,12 @@ public:
     replace_rec_fn_t(F const & f, bool use_cache) : m_f(f), m_use_cache(use_cache) {}
     expr operator()(expr const & e) { return apply(e, 0); }
 };
+
+/* `replace` for callbacks that satisfy the `Cheap` condition of `replace_rec_fn_t`. */
+template<typename F>
+expr replace_cheap(expr const & e, F const & f, bool use_cache = true) {
+    return replace_rec_fn_t<F, true>(f, use_cache)(e);
+}
 
 /* Overload for callbacks given as lambdas, which avoids the `std::function` indirection. */
 template<typename F>
