@@ -15,7 +15,7 @@ namespace lean {
 expr instantiate(expr const & a, unsigned s, unsigned n, expr const * subst) {
     if (s >= get_loose_bvar_range(a) || n == 0)
         return a;
-    return replace(a, [=](expr const & m, unsigned offset) -> optional<expr> {
+    return replace_cheap(a, [=](expr const & m, unsigned offset) -> optional<expr> {
             unsigned s1 = s + offset;
             if (s1 < s)
                 return some_expr(m); // overflow, vidx can't be >= max unsigned
@@ -57,7 +57,7 @@ static object * lean_expr_instantiate_core(b_obj_arg a0, size_t n, object** subs
         lean_inc(a0);
         return a0;
     }
-    expr r = replace(a, [=](expr const & m, unsigned offset) -> optional<expr> {
+    expr r = replace_cheap(a, [=](expr const & m, unsigned offset) -> optional<expr> {
             if (offset >= get_loose_bvar_range(m))
                 return some_expr(m); // expression m does not contain loose bound variables with idx >= offset
             if (is_bvar(m)) {
@@ -98,7 +98,7 @@ extern "C" LEAN_EXPORT object * lean_expr_instantiate_range(b_obj_arg a, b_obj_a
 expr instantiate_rev(expr const & a, unsigned n, expr const * subst) {
     if (!has_loose_bvars(a))
         return a;
-    return replace(a, [=](expr const & m, unsigned offset) -> optional<expr> {
+    return replace_cheap(a, [=](expr const & m, unsigned offset) -> optional<expr> {
             if (offset >= get_loose_bvar_range(m))
                 return some_expr(m); // expression m does not contain loose bound variables with idx >= offset
             if (is_bvar(m)) {
@@ -122,7 +122,7 @@ static object * lean_expr_instantiate_rev_core(object * a0, size_t n, object ** 
         lean_inc(a0);
         return a0;
     }
-    expr r = replace(a, [=](expr const & m, unsigned offset) -> optional<expr> {
+    expr r = replace_cheap(a, [=](expr const & m, unsigned offset) -> optional<expr> {
             if (offset >= get_loose_bvar_range(m))
                 return some_expr(m); // expression m does not contain loose bound variables with idx >= offset
             if (is_bvar(m)) {
