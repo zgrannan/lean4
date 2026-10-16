@@ -22,9 +22,9 @@ configure() { # FLAGS LINKER_FLAGS
     -DLEAN_EXTRA_CXX_FLAGS="$1" -DLEANC_EXTRA_CC_FLAGS="$1" -DLEAN_EXTRA_LINKER_FLAGS="$2")
 }
 
-generate="-fprofile-generate -fprofile-update=prefer-atomic -fprofile-dir=$gcda $extra"
-use="-fprofile-use -fprofile-dir=$gcda -fprofile-correction -fprofile-partial-training \
--Wno-missing-profile -Wno-coverage-mismatch $extra"
+source "$src/script/pcg_pgo_flags.sh"
+generate=$(pgo_flags generate "$gcda" "$extra")
+use=$(pgo_flags use "$gcda" "$extra")
 
 configure "$generate" "-fprofile-generate"
 make -C "$build" -j"$jobs"
