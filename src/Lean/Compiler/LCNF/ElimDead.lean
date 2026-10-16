@@ -16,8 +16,7 @@ so we opt for a safe subset.
 
 namespace Lean.Compiler.LCNF
 
--- This is sometimes used non-linearly, so use a tree set instead of a hash set.
-public abbrev UsedLocalDecls := FVarIdSet
+public abbrev UsedLocalDecls := FVarIdHashSet
 
 /--
 Collect set of (let) free variables in a LCNF value.
