@@ -30,6 +30,7 @@ functions, which have a (relatively) homogeneous ABI that we can use without run
 #include <vector>
 #include <shared_mutex>
 #include <atomic>
+#include <iostream>
 #include <deque>
 #include <unordered_map>
 #include <cstdlib>
@@ -828,11 +829,6 @@ public:
    caches of persistent declarations are only valid for one epoch. */
 static std::atomic<uint64_t> g_ir_epoch(1);
 
-struct tl_const {
-    bool m_is_scalar;
-    value m_val;
-};
-
 struct tl_code_entry {
     ccode * m_code = nullptr;
     unsigned m_calls = 0;
@@ -842,7 +838,6 @@ struct tl_code_entry {
 struct tl_ir_state {
     uint64_t m_epoch;
     name_hash_map<symbol_cache_entry *> m_syms;
-    name_hash_map<tl_const> m_consts;
     std::unordered_map<object *, tl_code_entry> m_codes;
 };
 
@@ -1392,13 +1387,7 @@ private:
     }
 
     /** \brief Evaluate nullary function ("constant"). */
-    value load(name const & fn, type t, bool * stable = nullptr) {
-        tl_ir_state & st = tl_state();
-        auto tc = st.m_consts.find(fn);
-        if (tc != st.m_consts.end()) {
-            if (stable) *stable = true;
-            return tc->second.m_val;
-        }
+    value load(name const & fn, type t) {
         auto cached_entry = m_constant_cache.find(fn);
         if (cached_entry != m_constant_cache.end()) {
             auto cached = cached_entry->second;
@@ -1455,15 +1444,7 @@ private:
             r = eval_body(decl_fun_body(e.m_decl));
             pop_frame(r, decl_type(e.m_decl));
         }
-        if (e.m_persistent) {
-            // The value of a constant of an imported declaration is shared by all interpreters of
-            // the thread, just like the value of a natively compiled constant is shared by the process.
-            if (!type_is_scalar(t)) mark_persistent(r.m_obj);
-            st.m_consts.insert({ fn, tl_const { type_is_scalar(t), r } });
-            if (stable) *stable = true;
-        } else {
-            m_constant_cache.insert({ fn, constant_cache_entry { type_is_scalar(t), r } });
-        }
+        m_constant_cache.insert({ fn, constant_cache_entry { type_is_scalar(t), r } });
         return r;
     }
 
@@ -1771,19 +1752,9 @@ private:
                 break;
             }
             case ck::Const: {
-                if (n->m_flag) {
-                    fp[n->m_dst] = n->m_lit;
-                } else {
-                    bool stable = false;
-                    value r = load(n->m_fn, n->m_ty, &stable);
-                    LEAN_IR_REFRESH();
-                    fp[n->m_dst] = r;
-                    if (stable) {
-                        // the value of an imported constant never changes within an epoch
-                        const_cast<cnode *>(n)->m_lit = r;
-                        const_cast<cnode *>(n)->m_flag = true;
-                    }
-                }
+                value r = load(n->m_fn, n->m_ty);
+                LEAN_IR_REFRESH();
+                fp[n->m_dst] = r;
                 n = n->m_next;
                 break;
             }
