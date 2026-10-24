@@ -1,10 +1,13 @@
-# The `pcg-optimized` branch
+# The `pcg-optimized-4.36-rc1` branch
 
-This branch of the fork is v4.35.0 plus changes that reduce the CPU time of building the `pcg-docs`
-formalization. It produces the same `.olean`, `.ilean`, `.c` and message output as v4.35.0 (checked
-byte for byte, apart from the githash in the `.olean` header, over all 1306 modules that
-`lake build` of the library roots elaborates) and passes the `elab`, `elab_fail`, `compile` and
-`docparse` test piles (3816 tests).
+This branch is Lean v4.36.0-rc1 plus the 24 commits from `pcg-optimized` at
+`57e46a766d502ca15b86ed2457d6701b33d051e2`. The import changes use 4.36's
+`SearchPath.findRootWithExt`. The interpreter retains 4.36's frame sizing,
+return-type handling, and diagnostics for unreachable IR bodies.
+
+The workflow runs the `elab`, `elab_fail`, `compile`, and `docparse` test piles before publishing
+an ordinary toolchain. The PGO profiles remain those recorded for the 4.35-based toolchain;
+GCC ignores profiles that do not match a function's current source.
 
 ## Changes
 
@@ -18,7 +21,12 @@ byte for byte, apart from the githash in the `.olean` header, over all 1306 modu
 | `replace_rec_fn` takes the callback as a template parameter and uses an open-addressing cache | `instantiate`, `abstract`, ... no longer go through `std::function` and `std::unordered_map`. |
 | `lean.skipIlean` (opt-in) | Writes `.ilean` files without references and declarations. |
 
-## Measurements
+## Measurements of the 4.35.0 toolchain
+
+The 4.35.0 version produced the same `.olean`, `.ilean`, `.c`, and message output as upstream
+v4.35.0, apart from the githash in the `.olean` header, across 1306 modules. It passed 3816 tests
+in the `elab`, `elab_fail`, `compile`, and `docparse` piles. The measurements that follow are for
+that version.
 
 Callgrind instruction counts (`valgrind --tool=callgrind`, one `lean` invocation per module as Lake
 runs it, imports and options from the module's `.setup.json`):
