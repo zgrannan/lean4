@@ -1,7 +1,7 @@
 name: PCG toolchain
 
-# Builds the Lean toolchain used by the `pcg-docs` CI and publishes it as a workflow artifact.
-# `pcg-docs` pins the commit of this branch in `formalization/pcg-lean-rev` and downloads the
+# Builds PCG Lean toolchains and publishes them as workflow artifacts.
+# `pcg-docs` selects a commit in `formalization/pcg-lean-rev` and downloads the
 # artifact of the run that built that commit (see `scripts/fetch_pcg_lean.py` there).
 #
 # The compiler is built with GCC profile-guided optimization when `script/pgo/profile-<arch>.tar.xz`
@@ -13,6 +13,7 @@ on:
   push:
     branches:
       - pcg-optimized
+      - pcg-optimized-4.36-rc1
   workflow_dispatch:
     inputs:
       pgo:
@@ -115,6 +116,13 @@ jobs:
 
       - name: Build
         run: make -C build -j"$(nproc)"
+
+      - name: Test elaboration and compilation
+        if: env.PGO_MODE != 'instrument'
+        run: |
+          ctest --test-dir build/stage1 --output-on-failure \
+            --parallel "$(nproc)" --no-tests=error \
+            -R '^(elab|elab_fail|compile|docparse)/'
 
       - name: Install
         run: |
