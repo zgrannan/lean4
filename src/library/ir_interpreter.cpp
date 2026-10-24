@@ -1586,8 +1586,9 @@ private:
             m_arg_stack.push_back(n->m_args[i] == IRRELEVANT_ARG ? value(box(0)) : fp[n->m_args[i]]);
         }
         push_frame(s.m_decl, nb);
-        value r = eval_body(decl_fun_body(s.m_decl));
-        pop_frame(r, s.m_ret_type);
+        type t = s.m_ret_type;
+        value r = eval_decl_body(s.m_decl);
+        pop_frame(r, t);
         return r;
     }
 
