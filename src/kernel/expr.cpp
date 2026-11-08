@@ -186,7 +186,7 @@ struct kernel_arena {
     unsigned m_depth = 0;
     bool m_active = false;
     bool m_retain_on_exit = false;
-    uint32_t m_epoch = 1;
+    uint32_t m_epoch = 0;
     tracked_entry m_tracked[TRACKED_MASK + 1];
     std::vector<object *> m_heap_refs;
     std::vector<char *> m_retained_slabs;
@@ -283,7 +283,6 @@ struct kernel_arena {
         m_curr_slab = 0;
         m_offset = 0;
         m_used_bytes = 0;
-        next_epoch();
     }
 };
 
@@ -293,6 +292,7 @@ kernel_arena_scope::kernel_arena_scope() {
     m_outermost = (g_kernel_arena.m_depth == 0);
     ++g_kernel_arena.m_depth;
     if (m_outermost) {
+        g_kernel_arena.next_epoch();
         g_kernel_arena.m_active = true;
     }
 }

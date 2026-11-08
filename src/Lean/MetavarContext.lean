@@ -717,7 +717,7 @@ private def shouldVisit (e : Expr) : M Bool := do
     modify fun s => { s with visited := s.visited.insert e }
     return true
 
-@[specialize] private partial def dep (pf : FVarId → Bool) (pm : MVarId →  Bool) (e : Expr) : M Bool :=
+@[extern "lean_depends_on_dep_visit", specialize] private partial def dep (pf : FVarId → Bool) (pm : MVarId →  Bool) (e : Expr) : M Bool :=
   let rec
     visit (e : Expr) : M Bool := do
       if !(← shouldVisit e) then
