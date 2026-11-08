@@ -1,18 +1,18 @@
-31
-38
-45
-52
-59
-66
-73
-7
-43
+30
+37
+44
 51
-57
-63
-69
-75
-@OfNat.ofNat.{0} Nat (nat_lit 81) (instOfNatNat (nat_lit 81))
+58
+65
+72
+6
+42
+50
+56
+62
+68
+74
+@OfNat.ofNat.{0} Nat (nat_lit 80) (instOfNatNat (nat_lit 80))
 [Meta.debug] fun {G : Type 1} [inst : Group.{1} G] =>
       @Group.mk.{1}
         (Prod.{1, 1} G
