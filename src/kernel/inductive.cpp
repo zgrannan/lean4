@@ -1305,6 +1305,7 @@ environment environment::add_inductive(declaration const & d) const {
            otherwise escape type checking. We check them at the end, using `new_env`, to avoid
            type checking terms in an environment containing auxiliary declarations. */
         {
+            kernel_arena_scope arena;
             type_checker tc(new_env, res.m_params_lctx, diag.get(), inductive_decl(d).is_unsafe() ? definition_safety::unsafe : definition_safety::safe);
             res.m_aux2nested.for_each([&](name const &, expr const & nested) {
                     tc.check(nested, inductive_decl(d).get_lparams());
@@ -1319,6 +1320,7 @@ environment environment::add_inductive(declaration const & d) const {
            checks in the nested inductive handling.
         */
         {
+            kernel_arena_scope arena;
             type_checker tc(new_env, diag.get(), inductive_decl(d).is_unsafe() ? definition_safety::unsafe : definition_safety::safe);
             for (inductive_type const & ind_type : ind_d.get_types()) {
                 for (constructor const & cnstr : ind_type.get_cnstrs()) {

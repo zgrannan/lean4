@@ -34,11 +34,6 @@ level mk_max_core(level const & l1, level const & l2) { return level(lean_level_
 level mk_imax_core(level const & l1, level const & l2) { return level(lean_level_mk_imax(l1.to_obj_arg(), l2.to_obj_arg())); }
 level mk_univ_param(name const & n) { return level(lean_level_mk_param(n.to_obj_arg())); }
 
-unsigned level::hash() const { return lean_level_hash(to_obj_arg()); }
-unsigned get_depth(level const & l) { return lean_level_depth(l.to_obj_arg()); }
-bool has_param(level const & l) { return lean_level_has_param(l.to_obj_arg()); }
-bool has_mvar(level const & l) { return lean_level_has_mvar(l.to_obj_arg()); }
-
 extern "C" LEAN_EXPORT uint64_t lean_level_mk_data (uint64_t h, object * depth, uint8_t hasMVar, uint8_t hasParam) {
     if (!is_scalar(depth))
         lean_internal_panic("universe level depth is too big");
@@ -274,29 +269,38 @@ level update_max(level const & l, level const & new_lhs, level const & new_rhs) 
         return mk_imax(new_lhs, new_rhs);
 }
 
+static level instantiate_core(level const & l, names const & ps, levels const & ls) {
+    if (!has_param(l))
+        return l;
+    switch (l.kind()) {
+    case level_kind::Succ:
+        return update_succ(l, instantiate_core(succ_of(l), ps, ls));
+    case level_kind::Max: case level_kind::IMax: {
+        level l1 = instantiate_core(level_lhs(l), ps, ls);
+        level l2 = instantiate_core(level_rhs(l), ps, ls);
+        return update_max(l, l1, l2);
+    }
+    case level_kind::Param: {
+        name const & id = param_id(l);
+        names const * it1  = &ps;
+        levels const * it2 = &ls;
+        while (!is_nil(*it1) && !is_nil(*it2)) {
+            if (head(*it1) == id)
+                return head(*it2);
+            it1 = &tail(*it1);
+            it2 = &tail(*it2);
+        }
+        return l;
+    }
+    case level_kind::Zero: case level_kind::MVar:
+        return l;
+    }
+    lean_unreachable();
+}
+
 level instantiate(level const & l, names const & ps, levels const & ls) {
     lean_assert(length(ps) == length(ls));
-    return replace(l, [=](level const & l) {
-            if (!has_param(l)) {
-                return some_level(l);
-            } else if (is_param(l)) {
-                name const & id = param_id(l);
-                names const *it1  = &ps;
-                levels const *it2 = &ls;
-                /* The assertion above ensures that !is_nil(*it2) is unnecessay, but we
-                   we keep it here to ensure the lean_instantiate_lparams does not crash
-                   at runtime when misused. */
-                while (!is_nil(*it1) && !is_nil(*it2)) {
-                    if (head(*it1) == id)
-                        return some_level(head(*it2));
-                    it1 = &tail(*it1);
-                    it2 = &tail(*it2);
-                }
-                return some_level(l);
-            } else {
-                return none_level();
-            }
-        });
+    return instantiate_core(l, ps, ls);
 }
 
 static void print(std::ostream & out, level l);

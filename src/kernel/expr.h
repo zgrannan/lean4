@@ -151,8 +151,18 @@ inline bool has_fvar(expr const & e) {
     lean_assert(r == has_fvar_core(e)); // ensure the C++ implementation matches the Lean one.
     return r;
 }
-bool has_univ_param(expr const & e);
-unsigned get_loose_bvar_range(expr const & e);
+bool has_univ_param_core(expr const & e);
+inline bool has_univ_param(expr const & e) {
+    bool r = ((get_data(e) >> 43) & 1) == 1;
+    lean_assert(r == has_univ_param_core(e));
+    return r;
+}
+unsigned get_loose_bvar_range_core(expr const & e);
+inline unsigned get_loose_bvar_range(expr const & e) {
+    unsigned r = static_cast<unsigned>(get_data(e) >> 44);
+    lean_assert(r == get_loose_bvar_range_core(e));
+    return r;
+}
 
 struct expr_hash { unsigned operator()(expr const & e) const { return hash(e); } };
 struct expr_pair_hash {
@@ -181,7 +191,20 @@ inline bool is_mdata(expr const & e)       { return e.kind() == expr_kind::MData
 inline bool is_proj(expr const & e)        { return e.kind() == expr_kind::Proj; }
 inline bool is_binding(expr const & e)     { return is_lambda(e) || is_pi(e); }
 
-bool is_atomic(expr const & e);
+inline bool is_atomic(expr const & e) {
+    switch (e.kind()) {
+    case expr_kind::Const: case expr_kind::Sort:
+    case expr_kind::BVar:  case expr_kind::Lit:
+    case expr_kind::MVar:  case expr_kind::FVar:
+        return true;
+    case expr_kind::App:
+    case expr_kind::Lambda:
+    case expr_kind::Pi:    case expr_kind::Let:
+    case expr_kind::MData: case expr_kind::Proj:
+        return false;
+    }
+    lean_unreachable();
+}
 bool is_arrow(expr const & t);
 // =======================================
 
@@ -245,7 +268,13 @@ inline expr const &    app_arg(expr const & e)               { lean_assert(is_ap
 inline name const &    binding_name(expr const & e)          { lean_assert(is_binding(e)); return static_cast<name const &>(cnstr_get_ref(e, 0)); }
 inline expr const &    binding_domain(expr const & e)        { lean_assert(is_binding(e)); return static_cast<expr const &>(cnstr_get_ref(e, 1)); }
 inline expr const &    binding_body(expr const & e)          { lean_assert(is_binding(e)); return static_cast<expr const &>(cnstr_get_ref(e, 2)); }
-binder_info binding_info(expr const & e);
+binder_info            binding_info_core(expr const & e);
+inline binder_info     binding_info(expr const & e) {
+    lean_assert(is_binding(e));
+    binder_info r = static_cast<binder_info>(lean_ctor_get_uint8(e.raw(), 3*sizeof(object*) + sizeof(uint64_t)));
+    lean_assert(r == binding_info_core(e));
+    return r;
+}
 inline name const &    let_name(expr const & e)              { lean_assert(is_let(e)); return static_cast<name const &>(cnstr_get_ref(e, 0)); }
 inline expr const &    let_type(expr const & e)              { lean_assert(is_let(e)); return static_cast<expr const &>(cnstr_get_ref(e, 1)); }
 inline expr const &    let_value(expr const & e)             { lean_assert(is_let(e)); return static_cast<expr const &>(cnstr_get_ref(e, 2)); }
@@ -330,6 +359,28 @@ std::ostream & operator<<(std::ostream & out, expr const & e);
 
 void initialize_expr();
 void finalize_expr();
+
+struct kernel_arena_stats {
+    size_t m_peak_bytes;
+    size_t m_total_alloc_bytes;
+    size_t m_total_scopes;
+};
+
+struct kernel_arena_scope {
+    bool m_outermost;
+    kernel_arena_scope();
+    ~kernel_arena_scope();
+};
+
+struct kernel_arena_pause_scope {
+    bool m_prev_active;
+    kernel_arena_pause_scope();
+    ~kernel_arena_pause_scope();
+};
+
+expr kernel_arena_promote(expr const & e);
+void kernel_arena_retain_on_exception();
+kernel_arena_stats get_kernel_arena_stats();
 
 /* ================= LEGACY ============== */
 inline bool has_expr_metavar(expr const & e) { return has_expr_mvar(e); }

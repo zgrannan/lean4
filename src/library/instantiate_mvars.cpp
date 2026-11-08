@@ -114,28 +114,169 @@ static name delayed_assignment_mvar_id_pending(delayed_assignment const & d) {
     return name(lean_delayed_mvar_assignment_mvar_id_pending(d.to_obj_arg()));
 }
 
+/* Thread-local epoch-tagged flat caches for Pass 1 (level and direct expr mvars). */
+struct direct_mvars_tls {
+    static constexpr size_t LEVEL_CAP  = 4096;
+    static constexpr size_t LEVEL_MASK = LEVEL_CAP - 1;
+    static constexpr size_t EXPR_CAP   = 65536;
+    static constexpr size_t EXPR_MASK  = EXPR_CAP - 1;
+    static constexpr size_t NAME_CAP   = 8192;
+    static constexpr size_t NAME_MASK  = NAME_CAP - 1;
+
+    struct kv_slot {
+        lean_object * key   = nullptr;
+        lean_object * val   = nullptr;
+        uint32_t      epoch = 0;
+    };
+    struct key_slot {
+        lean_object * key   = nullptr;
+        uint32_t      epoch = 0;
+    };
+
+    kv_slot  m_levels[LEVEL_CAP];
+    kv_slot  m_exprs[EXPR_CAP];
+    key_slot m_names[NAME_CAP];
+    uint32_t m_epoch = 1;
+    unsigned m_depth = 0;
+    std::vector<lean_object *> m_to_dec;
+
+    ~direct_mvars_tls() {
+        for (lean_object * o : m_to_dec) {
+            lean_dec(o);
+        }
+    }
+
+    uint32_t enter() {
+        ++m_depth;
+        ++m_epoch;
+        if (LEAN_UNLIKELY(m_epoch == 0)) {
+            for (size_t i = 0; i < LEVEL_CAP; ++i) m_levels[i].epoch = 0;
+            for (size_t i = 0; i < EXPR_CAP; ++i)  m_exprs[i].epoch  = 0;
+            for (size_t i = 0; i < NAME_CAP; ++i)  m_names[i].epoch  = 0;
+            m_epoch = 1;
+        }
+        return m_epoch;
+    }
+
+    void leave() {
+        --m_depth;
+        if (m_depth == 0) {
+            for (lean_object * o : m_to_dec) {
+                lean_dec(o);
+            }
+            m_to_dec.clear();
+        }
+    }
+
+    inline void save_obj(lean_object * o) {
+        lean_inc(o);
+        m_to_dec.push_back(o);
+    }
+
+    inline lean_object * find_level(lean_object * k, uint32_t ep) const {
+        size_t idx = ((uintptr_t)k >> 3) & LEVEL_MASK;
+        for (size_t i = 0; i < 16; ++i) {
+            kv_slot const & s = m_levels[(idx + i) & LEVEL_MASK];
+            if (s.epoch < ep) return nullptr;
+            if (s.epoch == ep && s.key == k) return s.val;
+        }
+        return nullptr;
+    }
+
+    inline void insert_level(lean_object * k, lean_object * v, uint32_t ep) {
+        size_t idx = ((uintptr_t)k >> 3) & LEVEL_MASK;
+        size_t target = (idx + 15) & LEVEL_MASK;
+        for (size_t i = 0; i < 16; ++i) {
+            size_t cur = (idx + i) & LEVEL_MASK;
+            if (m_levels[cur].epoch < ep || m_levels[cur].key == k) {
+                target = cur;
+                break;
+            }
+        }
+        m_levels[target].key   = k;
+        m_levels[target].val   = v;
+        m_levels[target].epoch = ep;
+        if (v != k) save_obj(v);
+    }
+
+    inline lean_object * find_expr(lean_object * k, uint32_t ep) const {
+        size_t idx = (((uintptr_t)k >> 3) * 11400714819323198485ULL >> 32) & EXPR_MASK;
+        for (size_t i = 0; i < 32; ++i) {
+            kv_slot const & s = m_exprs[(idx + i) & EXPR_MASK];
+            if (s.epoch < ep) return nullptr;
+            if (s.epoch == ep && s.key == k) return s.val;
+        }
+        return nullptr;
+    }
+
+    inline void insert_expr(lean_object * k, lean_object * v, uint32_t ep) {
+        size_t idx = (((uintptr_t)k >> 3) * 11400714819323198485ULL >> 32) & EXPR_MASK;
+        size_t target = (idx + 31) & EXPR_MASK;
+        for (size_t i = 0; i < 32; ++i) {
+            size_t cur = (idx + i) & EXPR_MASK;
+            if (m_exprs[cur].epoch < ep || m_exprs[cur].key == k) {
+                target = cur;
+                break;
+            }
+        }
+        m_exprs[target].key   = k;
+        m_exprs[target].val   = v;
+        m_exprs[target].epoch = ep;
+        if (v != k) save_obj(v);
+    }
+
+    inline bool check_and_insert_name(name const & n, uint32_t ep) {
+        size_t idx = n.hash() & NAME_MASK;
+        size_t target = (idx + 31) & NAME_MASK;
+        for (size_t i = 0; i < 32; ++i) {
+            size_t cur = (idx + i) & NAME_MASK;
+            key_slot const & s = m_names[cur];
+            if (s.epoch < ep) {
+                target = cur;
+                break;
+            }
+            if (s.epoch == ep && (s.key == n.raw() || name::eq(s.key, n.raw()))) {
+                return true;
+            }
+        }
+        m_names[target].key   = n.raw();
+        m_names[target].epoch = ep;
+        save_obj(n.raw());
+        return false;
+    }
+};
+
+static thread_local direct_mvars_tls g_direct_mvars_tls;
+
 /* Level metavariable instantiation. */
 class instantiate_lmvars_all_fn {
     metavar_ctx & m_mctx;
-    lean::unordered_map<lean_object *, level> m_cache;
-    std::vector<level> m_saved;
+    uint32_t      m_epoch;
+    bool          m_own_scope;
 
     inline level cache(level const & l, level r, bool shared) {
         if (shared) {
-            m_cache.insert(mk_pair(l.raw(), r));
+            g_direct_mvars_tls.insert_level(l.raw(), r.raw(), m_epoch);
         }
         return r;
     }
 public:
-    instantiate_lmvars_all_fn(metavar_ctx & mctx):m_mctx(mctx) {}
+    instantiate_lmvars_all_fn(metavar_ctx & mctx, uint32_t epoch, bool own_scope)
+        : m_mctx(mctx), m_epoch(epoch), m_own_scope(own_scope) {}
+    explicit instantiate_lmvars_all_fn(metavar_ctx & mctx)
+        : m_mctx(mctx), m_epoch(g_direct_mvars_tls.enter()), m_own_scope(true) {}
+    ~instantiate_lmvars_all_fn() {
+        if (m_own_scope) {
+            g_direct_mvars_tls.leave();
+        }
+    }
     level visit(level const & l) {
         if (!has_mvar(l))
             return l;
         bool shared = false;
         if (is_shared(l)) {
-            auto it = m_cache.find(l.raw());
-            if (it != m_cache.end()) {
-                return it->second;
+            if (lean_object * cached = g_direct_mvars_tls.find_level(l.raw(), m_epoch)) {
+                return level(cached, true);
             }
             shared = true;
         }
@@ -157,13 +298,14 @@ public:
                 } else {
                     level a_new = visit(a);
                     if (!is_eqp(a, a_new)) {
-                        m_saved.push_back(a);
+                        g_direct_mvars_tls.save_obj(a.raw());
                         assign_lmvar(m_mctx, mvar_id(l), a_new);
                     }
                     return a_new;
                 }
             }
         }}
+        lean_unreachable();
     }
     level operator()(level const & l) { return visit(l); }
 };
@@ -178,14 +320,11 @@ public:
 
 class instantiate_direct_fn {
     metavar_ctx & m_mctx;
+    uint32_t      m_epoch;
     instantiate_lmvars_all_fn m_level_fn;
-    name_set m_already_normalized;
     /* Set to true when a delayed-assigned MVar with an assigned pending MVar
        is encountered. Pass 2 is needed to resolve or write back such MVars. */
     bool m_has_updateable_delayed;
-
-    lean::unordered_map<lean_object *, expr> m_cache;
-    std::vector<expr> m_saved;
 
     level visit_level(level const & l) {
         return m_level_fn(l);
@@ -197,7 +336,7 @@ class instantiate_direct_fn {
 
     inline expr cache(expr const & e, expr r, bool shared) {
         if (shared) {
-            m_cache.insert(mk_pair(e.raw(), r));
+            g_direct_mvars_tls.insert_expr(e.raw(), r.raw(), m_epoch);
         }
         return r;
     }
@@ -210,13 +349,12 @@ class instantiate_direct_fn {
             return optional<expr>();
         }
         expr a(r.get_val());
-        if (!has_mvar(a) || m_already_normalized.contains(mid)) {
+        if (!has_mvar(a) || g_direct_mvars_tls.check_and_insert_name(mid, m_epoch)) {
             return optional<expr>(a);
         }
-        m_already_normalized.insert(mid);
         expr a_new = visit(a);
         if (!is_eqp(a, a_new)) {
-            m_saved.push_back(a);
+            g_direct_mvars_tls.save_obj(a.raw());
             assign_mvar(m_mctx, mid, a_new);
         }
         return optional<expr>(a_new);
@@ -228,7 +366,7 @@ class instantiate_direct_fn {
     expr visit_nonmvar_app(expr const & e) {
         expr new_a = visit(app_arg(e));
         expr const & fn = app_fn(e);
-        expr new_f = is_app(fn) ? visit_nonmvar_app(fn) : visit(fn);
+        expr new_f = !has_mvar(fn) ? fn : (is_app(fn) ? visit_nonmvar_app(fn) : visit(fn));
         return update_app(e, new_f, new_a);
     }
 
@@ -286,7 +424,10 @@ class instantiate_direct_fn {
 
 public:
     instantiate_direct_fn(metavar_ctx & mctx)
-        : m_mctx(mctx), m_level_fn(mctx), m_has_updateable_delayed(false) {}
+        : m_mctx(mctx), m_epoch(g_direct_mvars_tls.enter()), m_level_fn(mctx, m_epoch, false), m_has_updateable_delayed(false) {}
+    ~instantiate_direct_fn() {
+        g_direct_mvars_tls.leave();
+    }
     bool has_updateable_delayed() const { return m_has_updateable_delayed; }
 
     expr visit(expr const & e) {
@@ -294,9 +435,8 @@ public:
             return e;
         bool shared = false;
         if (is_shared(e)) {
-            auto it = m_cache.find(e.raw());
-            if (it != m_cache.end()) {
-                return it->second;
+            if (lean_object * cached = g_direct_mvars_tls.find_expr(e.raw(), m_epoch)) {
+                return expr(cached, true);
             }
             shared = true;
         }
@@ -322,6 +462,7 @@ public:
         case expr_kind::Let:
             return cache(e, update_let(e, visit(let_type(e)), visit(let_value(e)), visit(let_body(e))), shared);
         }
+        lean_unreachable();
     }
 
     expr operator()(expr const & e) { return visit(e); }
@@ -712,7 +853,9 @@ class instantiate_delayed_fn {
     expr visit_nonmvar_app(expr const & e) {
         expr new_a = visit(app_arg(e));
         expr const & fn = app_fn(e);
-        expr new_f = is_app(fn) ? visit_nonmvar_app(fn) : visit(fn);
+        expr new_f = ((!has_fvar(fn) || in_outer_mode()) && !has_expr_mvar(fn))
+            ? fn
+            : (is_app(fn) ? visit_nonmvar_app(fn) : visit(fn));
         return update_app(e, new_f, new_a);
     }
 
@@ -845,6 +988,12 @@ public:
    ============================================================================ */
 
 static object * run_instantiate_all(object * m, object * e) {
+    if (!has_mvar(TO_REF(expr, e))) {
+        object * r = alloc_cnstr(0, 2, 0);
+        cnstr_set(r, 0, m);
+        cnstr_set(r, 1, e);
+        return r;
+    }
     metavar_ctx mctx(m);
 
     /* Pass 1: instantiate updateable direct MVars, pre-normalize pending MVar values. */
@@ -870,6 +1019,12 @@ static object * run_instantiate_all(object * m, object * e) {
 }
 
 extern "C" LEAN_EXPORT object * lean_instantiate_level_mvars(object * m, object * l) {
+    if (!has_mvar(TO_REF(level, l))) {
+        object * r = alloc_cnstr(0, 2, 0);
+        cnstr_set(r, 0, m);
+        cnstr_set(r, 1, l);
+        return r;
+    }
     metavar_ctx mctx(m);
     level l_new = instantiate_lmvars_all_fn(mctx)(level(l));
     object * r = alloc_cnstr(0, 2, 0);

@@ -5,6 +5,7 @@ Released under Apache 2.0 license as described in the file LICENSE.
 Author: Leonardo de Moura
 */
 #include <vector>
+#include <cstring>
 #include <memory>
 #include "runtime/alloc.h"
 #include "runtime/interrupt.h"
@@ -14,6 +15,61 @@ Author: Leonardo de Moura
 #include "util/alloc.h"
 
 namespace lean {
+
+struct expr_eq_cache {
+    static constexpr size_t CAPACITY = 16384;
+    static constexpr size_t MASK = CAPACITY - 1;
+    struct slot {
+        lean_object * a;
+        lean_object * b;
+        uint32_t      epoch;
+    };
+    slot     m_slots[CAPACITY];
+    uint32_t m_epoch = 1;
+    uint32_t m_depth = 0;
+
+    expr_eq_cache() {
+        std::memset(m_slots, 0, sizeof(m_slots));
+    }
+
+    uint32_t enter() {
+        if (m_depth == 0 && m_epoch > 0xFFFF0000u) {
+            std::memset(m_slots, 0, sizeof(m_slots));
+            m_epoch = 1;
+        }
+        ++m_depth;
+        return ++m_epoch;
+    }
+
+    void leave() {
+        --m_depth;
+    }
+
+    bool check_and_insert(lean_object * a, lean_object * b, uint32_t my_epoch) {
+        size_t idx = static_cast<size_t>(hash(static_cast<unsigned>((uintptr_t)a >> 3), static_cast<unsigned>((uintptr_t)b >> 3))) & MASK;
+        unsigned insert_pos = 3;
+        for (unsigned i = 0; i < 4; ++i) {
+            slot const & s = m_slots[(idx + i) & MASK];
+            if (s.epoch == my_epoch) {
+                if (s.a == a && s.b == b)
+                    return true;
+            } else {
+                if (insert_pos == 3)
+                    insert_pos = i;
+                if (s.epoch < my_epoch)
+                    break;
+            }
+        }
+        slot & dst = m_slots[(idx + insert_pos) & MASK];
+        dst.a     = a;
+        dst.b     = b;
+        dst.epoch = my_epoch;
+        return false;
+    }
+};
+
+static thread_local expr_eq_cache g_expr_eq_cache;
+
 /**
 \brief Functional object for comparing expressions.
 
@@ -22,24 +78,14 @@ binder information attached to lambda and Pi expressions
 */
 template<bool CompareBinderInfo>
 class expr_eq_fn {
-    struct key_hasher {
-        std::size_t operator()(std::pair<lean_object *, lean_object *> const & p) const {
-            return hash((size_t)p.first >> 3, (size_t)p.second >> 3);
-        }
-    };
-    typedef lean::unordered_set<std::pair<lean_object *, lean_object *>, key_hasher> cache;
-    cache * m_cache = nullptr;
+    uint32_t m_epoch = 0;
     size_t m_counter = 0;
     bool check_cache(expr const & a, expr const & b) {
         if (!is_shared(a) || !is_shared(b))
             return false;
-        if (!m_cache)
-            m_cache = new cache();
-        std::pair<lean_object *, lean_object *> key(a.raw(), b.raw());
-        if (m_cache->find(key) != m_cache->end())
-            return true;
-        m_cache->insert(key);
-        return false;
+        if (m_epoch == 0)
+            m_epoch = g_expr_eq_cache.enter();
+        return g_expr_eq_cache.check_and_insert(a.raw(), b.raw(), m_epoch);
     }
     bool apply(expr const & a, expr const & b, bool root = false) {
         if (is_eqp(a, b))          return true;
@@ -114,7 +160,7 @@ class expr_eq_fn {
 public:
     expr_eq_fn() {}
     ~expr_eq_fn() {
-        if (m_cache) delete m_cache;
+        if (m_epoch != 0) g_expr_eq_cache.leave();
         if (m_counter > 0) add_heartbeats(m_counter);
     }
     bool operator()(expr const & a, expr const & b) { return apply(a, b, true); }
