@@ -269,6 +269,62 @@ level update_max(level const & l, level const & new_lhs, level const & new_rhs) 
         return mk_imax(new_lhs, new_rhs);
 }
 
+static bool subsumes(level const & u, level const & v) {
+    if (is_explicit(v) && to_offset(u).second >= get_depth(v))
+        return true;
+    if (is_max(u))
+        return v == max_lhs(u) || v == max_rhs(u);
+    return false;
+}
+
+static level simp_max(level const & l1, level const & l2, level const * orig) {
+    if (l1 == l2) {
+        return l1;
+    } else if (is_zero(l1)) {
+        return l2;
+    } else if (is_zero(l2)) {
+        return l1;
+    } else if (subsumes(l1, l2)) {
+        return l1;
+    } else if (subsumes(l2, l1)) {
+        return l2;
+    } else {
+        auto p1 = to_offset(l1);
+        auto p2 = to_offset(l2);
+        if (p1.first == p2.first) {
+            return p1.second >= p2.second ? l1 : l2;
+        } else if (orig) {
+            return *orig;
+        } else {
+            return mk_max_core(l1, l2);
+        }
+    }
+}
+
+static level simp_imax(level const & l1, level const & l2, level const * orig) {
+    if (is_not_zero(l2)) {
+        return simp_max(l1, l2, nullptr);
+    } else if (is_zero(l2)) {
+        return l2;
+    } else if (is_zero(l1)) {
+        return l2;
+    } else if (l1 == l2) {
+        return l1;
+    } else if (orig) {
+        return *orig;
+    } else {
+        return mk_imax_core(l1, l2);
+    }
+}
+
+static level update_max_simp(level const & l, level const & new_lhs, level const & new_rhs) {
+    bool eqp = is_eqp(level_lhs(l), new_lhs) && is_eqp(level_rhs(l), new_rhs);
+    if (is_max(l))
+        return simp_max(new_lhs, new_rhs, eqp ? &l : nullptr);
+    else
+        return simp_imax(new_lhs, new_rhs, eqp ? &l : nullptr);
+}
+
 static level instantiate_core(level const & l, names const & ps, levels const & ls) {
     if (!has_param(l))
         return l;
@@ -278,7 +334,7 @@ static level instantiate_core(level const & l, names const & ps, levels const & 
     case level_kind::Max: case level_kind::IMax: {
         level l1 = instantiate_core(level_lhs(l), ps, ls);
         level l2 = instantiate_core(level_rhs(l), ps, ls);
-        return update_max(l, l1, l2);
+        return update_max_simp(l, l1, l2);
     }
     case level_kind::Param: {
         name const & id = param_id(l);
@@ -311,7 +367,7 @@ level instantiate(level const & l, size_t n, object * const * ps, object * const
     case level_kind::Max: case level_kind::IMax: {
         level l1 = instantiate(level_lhs(l), n, ps, ls);
         level l2 = instantiate(level_rhs(l), n, ps, ls);
-        return update_max(l, l1, l2);
+        return update_max_simp(l, l1, l2);
     }
     case level_kind::Param: {
         object * id = param_id(l).raw();
