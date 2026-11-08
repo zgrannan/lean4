@@ -13,26 +13,42 @@ Author: Leonardo de Moura
 
 namespace lean {
 
+static thread_local replace_cache g_replace_cache;
+
+replace_cache & get_thread_replace_cache() {
+    return g_replace_cache;
+}
+
+struct generic_replace_policy {
+    static constexpr bool only_atomic = false;
+    std::function<optional<expr>(expr const &, unsigned)> const & m_f;
+    bool should_return_self(expr const &, unsigned) const { return false; }
+    expr visit_atomic(expr const & e, unsigned) const { return e; }
+    optional<expr> visit(expr const & e, unsigned offset) const {
+        return m_f(e, offset);
+    }
+};
+
 expr replace(expr const & e, std::function<optional<expr>(expr const &, unsigned)> const & f, bool use_cache) {
-    return replace_rec_fn_t<std::function<optional<expr>(expr const &, unsigned)>>(f, use_cache)(e);
+    return replace_custom(e, generic_replace_policy{f}, use_cache);
 }
 
 class replace_fn {
-    lean::unordered_map<lean_object *, expr> m_cache;
-    lean_object * m_f;
+    replace_cache & m_cache;
+    uint32_t        m_epoch;
+    lean_object *   m_f;
 
     expr save_result(expr const & e, expr const & r, bool shared) {
         if (shared)
-            m_cache.insert(mk_pair(e.raw(), r));
+            m_cache.insert(e.raw(), 0, m_epoch, r.raw());
         return r;
     }
 
     expr apply(expr const & e) {
         bool shared = false;
         if (is_shared(e)) {
-            auto it = m_cache.find(e.raw());
-            if (it != m_cache.end())
-                return it->second;
+            if (lean_object * cached = m_cache.find(e.raw(), 0, m_epoch))
+                return expr(cached, true);
             shared = true;
         }
 
@@ -77,7 +93,13 @@ class replace_fn {
         lean_unreachable();
     }
 public:
-    replace_fn(lean_object * f):m_f(f) {}
+    replace_fn(lean_object * f):
+        m_cache(get_thread_replace_cache()),
+        m_epoch(m_cache.enter()),
+        m_f(f) {}
+    ~replace_fn() {
+        m_cache.leave();
+    }
     expr operator()(expr const & e) { return apply(e); }
 };
 

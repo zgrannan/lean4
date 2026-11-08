@@ -38,15 +38,23 @@ extern "C" object * lean_local_ctx_find(object * lctx, object * name);
 local_ctx::local_ctx():object_ref(lean_mk_empty_local_ctx(box(0))) {
 }
 
+void local_ctx::add_local_decl(name const & n, name const & un, expr const & type, expr const & value) {
+    m_obj = lean_local_ctx_mk_let_decl(raw(), n.to_obj_arg(), un.to_obj_arg(), type.to_obj_arg(), value.to_obj_arg(), false);
+}
+
+void local_ctx::add_local_decl(name const & n, name const & un, expr const & type, binder_info bi) {
+    m_obj = lean_local_ctx_mk_local_decl(raw(), n.to_obj_arg(), un.to_obj_arg(), type.to_obj_arg(), static_cast<uint8>(bi));
+}
+
 local_decl local_ctx::mk_local_decl(name const & n, name const & un, expr const & type, expr const & value) {
     unsigned idx = unbox(lean_local_ctx_num_indices(to_obj_arg()));
-    m_obj = lean_local_ctx_mk_let_decl(raw(), n.to_obj_arg(), un.to_obj_arg(), type.to_obj_arg(), value.to_obj_arg(), false);
+    add_local_decl(n, un, type, value);
     return local_decl(idx, n, un, type, value);
 }
 
 local_decl local_ctx::mk_local_decl(name const & n, name const & un, expr const & type, binder_info bi) {
     unsigned idx = unbox(lean_local_ctx_num_indices(to_obj_arg()));
-    m_obj = lean_local_ctx_mk_local_decl(raw(), n.to_obj_arg(), un.to_obj_arg(), type.to_obj_arg(), static_cast<uint8>(bi));
+    add_local_decl(n, un, type, bi);
     return local_decl(idx, n, un, type, bi);
 }
 

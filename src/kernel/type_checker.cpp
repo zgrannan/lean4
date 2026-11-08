@@ -51,6 +51,11 @@ static expr * g_nat_xor      = nullptr;
 static expr * g_nat_shiftLeft  = nullptr;
 static expr * g_nat_shiftRight = nullptr;
 
+static thread_local flat_expr_table_pool g_expr_table_pool;
+flat_expr_table_pool & get_thread_expr_table_pool() {
+    return g_expr_table_pool;
+}
+
 type_checker::state::state(environment const & env):
     m_env(env), m_ngen(*g_kernel_fresh) {}
 
@@ -329,9 +334,8 @@ expr type_checker::infer_type_core(expr const & e, bool infer_only) {
     scope_rec_depth guard;
     check_system("type checker", /* do_check_interrupted */ true);
 
-    auto it = m_st->m_infer_type[infer_only].find(e);
-    if (it != m_st->m_infer_type[infer_only].end())
-        return it->second;
+    if (lean_object * cached = m_st->m_infer_type[infer_only].find(e))
+        return expr(cached, true);
 
     expr r;
     switch (e.kind()) {
@@ -353,7 +357,7 @@ expr type_checker::infer_type_core(expr const & e, bool infer_only) {
     case expr_kind::Let:      r = infer_let(e, infer_only);            break;
     }
 
-    m_st->m_infer_type[infer_only].insert(mk_pair(e, r));
+    m_st->m_infer_type[infer_only].insert(e, r);
     return r;
 }
 
@@ -484,9 +488,8 @@ expr type_checker::whnf_core(expr const & e, bool cheap_rec, bool cheap_proj) {
     }
 
     // check cache
-    auto it = m_st->m_whnf_core.find(e);
-    if (it != m_st->m_whnf_core.end())
-        return it->second;
+    if (lean_object * cached = m_st->m_whnf_core.find(e))
+        return expr(cached, true);
 
     // do the actual work
     expr r;
@@ -541,7 +544,7 @@ expr type_checker::whnf_core(expr const & e, bool cheap_rec, bool cheap_proj) {
     }
 
     if (!cheap_rec && !cheap_proj) {
-        m_st->m_whnf_core.insert(mk_pair(e, r));
+        m_st->m_whnf_core.insert(e, r);
     }
     return r;
 }
@@ -567,11 +570,10 @@ optional<expr> type_checker::unfold_definition_core(expr const & e) {
                 m_diag->record_unfold(d->get_name());
             }
             if (len > 0) {
-                auto it = m_st->m_unfold.find(e);
-                if (it != m_st->m_unfold.end())
-                    return some_expr(it->second);
+                if (lean_object * cached = m_st->m_unfold.find(e))
+                    return some_expr(expr(cached, true));
                 expr result = instantiate_value_lparams(*d, us);
-                m_st->m_unfold.insert(mk_pair(e, result));
+                m_st->m_unfold.insert(e, result);
                 return some_expr(result);
             } else {
                 return some_expr(instantiate_value_lparams(*d, us));
@@ -718,21 +720,20 @@ expr type_checker::whnf(expr const & e) {
     }
 
     // check cache
-    auto it = m_st->m_whnf.find(e);
-    if (it != m_st->m_whnf.end())
-        return it->second;
+    if (lean_object * cached = m_st->m_whnf.find(e))
+        return expr(cached, true);
 
     expr t = e;
     while (true) {
         expr t1 = whnf_core(t);
         if (auto v = reduce_nat(t1)) {
-            m_st->m_whnf.insert(mk_pair(e, *v));
+            m_st->m_whnf.insert(e, *v);
             return *v;
         } else if (auto next_t = unfold_definition(t1)) {
             t = *next_t;
         } else {
             auto r = t1;
-            m_st->m_whnf.insert(mk_pair(e, r));
+            m_st->m_whnf.insert(e, r);
             return r;
         }
     }
@@ -903,40 +904,40 @@ lbool type_checker::is_def_eq_proof_irrel(expr const & t, expr const & s) {
 
 bool type_checker::failed_before(expr const & t, expr const & s) const {
     if (hash(t) < hash(s)) {
-        return m_st->m_failure.find(mk_pair(t, s)) != m_st->m_failure.end();
+        return m_st->m_failure.contains(t, s);
     } else if (hash(t) > hash(s)) {
-        return m_st->m_failure.find(mk_pair(s, t)) != m_st->m_failure.end();
+        return m_st->m_failure.contains(s, t);
     } else {
         return
-            m_st->m_failure.find(mk_pair(t, s)) != m_st->m_failure.end() ||
-            m_st->m_failure.find(mk_pair(s, t)) != m_st->m_failure.end();
+            m_st->m_failure.contains(t, s) ||
+            m_st->m_failure.contains(s, t);
     }
 }
 
 void type_checker::cache_failure(expr const & t, expr const & s) {
     if (hash(t) <= hash(s))
-        m_st->m_failure.insert(mk_pair(t, s));
+        m_st->m_failure.insert(t, s);
     else
-        m_st->m_failure.insert(mk_pair(s, t));
+        m_st->m_failure.insert(s, t);
 }
 
 bool type_checker::succeeded_before(expr const & t, expr const & s) const {
     if (hash(t) < hash(s)) {
-        return m_st->m_success.find(mk_pair(t, s)) != m_st->m_success.end();
+        return m_st->m_success.contains(t, s);
     } else if (hash(t) > hash(s)) {
-        return m_st->m_success.find(mk_pair(s, t)) != m_st->m_success.end();
+        return m_st->m_success.contains(s, t);
     } else {
         return
-            m_st->m_success.find(mk_pair(t, s)) != m_st->m_success.end() ||
-            m_st->m_success.find(mk_pair(s, t)) != m_st->m_success.end();
+            m_st->m_success.contains(t, s) ||
+            m_st->m_success.contains(s, t);
     }
 }
 
 void type_checker::cache_success(expr const & t, expr const & s) {
     if (hash(t) <= hash(s))
-        m_st->m_success.insert(mk_pair(t, s));
+        m_st->m_success.insert(t, s);
     else
-        m_st->m_success.insert(mk_pair(s, t));
+        m_st->m_success.insert(s, t);
 }
 
 /**
@@ -1210,13 +1211,11 @@ bool type_checker::is_def_eq(expr const & t, expr const & s) {
 }
 
 type_checker::type_checker(environment const & env, local_ctx const & lctx, diagnostics * diag, definition_safety ds):
-    m_st_owner(true), m_st(new state(env)), m_diag(diag),
+    m_st_val(env), m_st(&m_st_val), m_diag(diag),
     m_lctx(lctx), m_definition_safety(ds), m_lparams(nullptr) {
 }
 
 type_checker::~type_checker() {
-    if (m_st_owner)
-        delete m_st;
 }
 
 inline static expr * new_persistent_expr_const(name const & n) {

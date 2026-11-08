@@ -59,12 +59,19 @@ public:
     /* Low level `mk_local_decl` */
     local_decl mk_local_decl(name const & n, name const & un, expr const & type, expr const & value);
 
+    void add_local_decl(name const & n, name const & un, expr const & type, binder_info bi);
+    void add_local_decl(name const & n, name const & un, expr const & type, expr const & value);
+
     expr mk_local_decl(name_generator & g, name const & un, expr const & type, binder_info bi = mk_binder_info()) {
-        return mk_local_decl(g.next(), un, type, bi).mk_ref();
+        name n = g.next();
+        add_local_decl(n, un, type, bi);
+        return mk_fvar(n);
     }
 
     expr mk_local_decl(name_generator & g, name const & un, expr const & type, expr const & value) {
-        return mk_local_decl(g.next(), un, type, value).mk_ref();
+        name n = g.next();
+        add_local_decl(n, un, type, value);
+        return mk_fvar(n);
     }
 
     /** \brief Return the local declarations for the given reference. */

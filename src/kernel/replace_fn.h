@@ -8,12 +8,180 @@ Author: Leonardo de Moura
 #include <tuple>
 #include <type_traits>
 #include <functional>
-#include <cstdlib>
+#include <vector>
+#include <cstring>
 #include "runtime/interrupt.h"
 #include "kernel/expr.h"
 #include "kernel/expr_maps.h"
 
 namespace lean {
+
+struct replace_cache {
+    static constexpr size_t CAPACITY = 65536;
+    static constexpr size_t MASK = CAPACITY - 1;
+    struct slot {
+        lean_object * key;
+        lean_object * val;
+        uint32_t      offset;
+        uint32_t      epoch;
+    };
+    slot                        m_slots[CAPACITY];
+    std::vector<lean_object *>  m_to_dec;
+    uint32_t                    m_epoch = 1;
+    uint32_t                    m_depth = 0;
+
+    replace_cache() {
+        std::memset(m_slots, 0, sizeof(m_slots));
+        m_to_dec.reserve(1024);
+    }
+    ~replace_cache() {
+        for (lean_object * o : m_to_dec) {
+            lean_dec_ref(o);
+        }
+        m_to_dec.clear();
+    }
+
+    uint32_t enter() {
+        if (m_depth == 0 && m_epoch > 0xFFFF0000u) {
+            std::memset(m_slots, 0, sizeof(m_slots));
+            m_epoch = 1;
+        }
+        ++m_depth;
+        return ++m_epoch;
+    }
+
+    void leave() {
+        lean_assert(m_depth > 0);
+        if (--m_depth == 0) {
+            for (lean_object * o : m_to_dec) {
+                lean_dec_ref(o);
+            }
+            m_to_dec.clear();
+        }
+    }
+
+    lean_object * find(lean_object * key, uint32_t offset, uint32_t my_epoch) const {
+        size_t idx = static_cast<size_t>(hash(static_cast<unsigned>((uintptr_t)key >> 3), offset)) & MASK;
+        for (unsigned i = 0; i < 4; ++i) {
+            slot const & s = m_slots[(idx + i) & MASK];
+            if (s.epoch == my_epoch) {
+                if (s.key == key && s.offset == offset)
+                    return s.val;
+            } else if (s.epoch < my_epoch) {
+                break;
+            }
+        }
+        return nullptr;
+    }
+
+    void insert(lean_object * key, uint32_t offset, uint32_t my_epoch, lean_object * val) {
+        if (!lean_is_scalar(val) && lean_has_rc(val)) {
+            lean_inc_ref(val);
+            m_to_dec.push_back(val);
+        }
+        size_t idx = static_cast<size_t>(hash(static_cast<unsigned>((uintptr_t)key >> 3), offset)) & MASK;
+        for (unsigned i = 0; i < 3; ++i) {
+            slot & s = m_slots[(idx + i) & MASK];
+            if (s.epoch != my_epoch) {
+                s.key    = key;
+                s.val    = val;
+                s.offset = offset;
+                s.epoch  = my_epoch;
+                return;
+            }
+        }
+        slot & s = m_slots[(idx + 3) & MASK];
+        s.key    = key;
+        s.val    = val;
+        s.offset = offset;
+        s.epoch  = my_epoch;
+    }
+};
+
+replace_cache & get_thread_replace_cache();
+
+template<typename Policy>
+class replace_custom_fn {
+    replace_cache & m_cache;
+    Policy const &  m_policy;
+    uint32_t        m_epoch;
+    bool            m_use_cache;
+
+    expr save_result(expr const & e, unsigned offset, expr r, bool shared) {
+        if (shared) {
+            m_cache.insert(e.raw(), offset, m_epoch, r.raw());
+        }
+        return r;
+    }
+
+    expr apply(expr const & e, unsigned offset) {
+        if (m_policy.should_return_self(e, offset)) {
+            return e;
+        }
+        if (Policy::only_atomic && is_atomic(e)) {
+            return m_policy.visit_atomic(e, offset);
+        }
+        bool shared = false;
+        if (m_use_cache && !is_likely_unshared(e)) {
+            if (lean_object * cached = m_cache.find(e.raw(), offset, m_epoch)) {
+                return expr(cached, true);
+            }
+            shared = true;
+        }
+        if (!Policy::only_atomic) {
+            if (optional<expr> r = m_policy.visit(e, offset)) {
+                return save_result(e, offset, std::move(*r), shared);
+            }
+        }
+        switch (e.kind()) {
+        case expr_kind::Const: case expr_kind::Sort:
+        case expr_kind::BVar:  case expr_kind::Lit:
+        case expr_kind::MVar:  case expr_kind::FVar:
+            return save_result(e, offset, e, shared);
+        case expr_kind::MData: {
+            expr new_e = apply(mdata_expr(e), offset);
+            return save_result(e, offset, update_mdata(e, new_e), shared);
+        }
+        case expr_kind::Proj: {
+            expr new_e = apply(proj_expr(e), offset);
+            return save_result(e, offset, update_proj(e, new_e), shared);
+        }
+        case expr_kind::App: {
+            expr new_f = apply(app_fn(e), offset);
+            expr new_a = apply(app_arg(e), offset);
+            return save_result(e, offset, update_app(e, new_f, new_a), shared);
+        }
+        case expr_kind::Pi: case expr_kind::Lambda: {
+            expr new_d = apply(binding_domain(e), offset);
+            expr new_b = apply(binding_body(e), offset+1);
+            return save_result(e, offset, update_binding(e, new_d, new_b), shared);
+        }
+        case expr_kind::Let: {
+            expr new_t = apply(let_type(e), offset);
+            expr new_v = apply(let_value(e), offset);
+            expr new_b = apply(let_body(e), offset+1);
+            return save_result(e, offset, update_let(e, new_t, new_v, new_b), shared);
+        }
+        }
+        lean_unreachable();
+    }
+public:
+    replace_custom_fn(Policy const & policy, bool use_cache = true):
+        m_cache(get_thread_replace_cache()),
+        m_policy(policy),
+        m_epoch(m_cache.enter()),
+        m_use_cache(use_cache) {}
+    ~replace_custom_fn() {
+        m_cache.leave();
+    }
+    expr operator()(expr const & e) { return apply(e, 0); }
+};
+
+template<typename Policy>
+inline expr replace_custom(expr const & e, Policy const & policy, bool use_cache = true) {
+    return replace_custom_fn<Policy>(policy, use_cache)(e);
+}
+
 /**
    \brief Apply <tt>f</tt> to the subexpressions of a given expression.
 
@@ -27,167 +195,21 @@ inline expr replace(expr const & e, std::function<optional<expr>(expr const &)> 
     return replace(e, [&](expr const & e, unsigned) { return f(e); }, use_cache);
 }
 
-/* Open-addressing hash table from (object, binder offset) to the replaced expression. */
-class replace_cache {
-    struct entry {
-        lean_object * m_key;
-        unsigned      m_offset;
-        lean_object * m_value;
-    };
-    entry * m_table = nullptr;
-    size_t  m_mask = 0;
-    size_t  m_size = 0;
-
-    static size_t hash_of(lean_object * k, unsigned offset) {
-        uint64_t h = (static_cast<uint64_t>(reinterpret_cast<uintptr_t>(k)) >> 3) * 0x9E3779B97F4A7C15ull;
-        h ^= (static_cast<uint64_t>(offset) + 1) * 0xC2B2AE3D27D4EB4Full;
-        return static_cast<size_t>(h ^ (h >> 29));
-    }
-    void grow() {
-        size_t new_cap = m_table ? (m_mask + 1) * 2 : 32;
-        entry * old = m_table;
-        size_t old_cap = m_table ? m_mask + 1 : 0;
-        m_table = static_cast<entry *>(calloc(new_cap, sizeof(entry)));
-        if (!m_table) lean_internal_panic_out_of_memory();
-        m_mask = new_cap - 1;
-        for (size_t i = 0; i < old_cap; i++) {
-            if (old[i].m_key) {
-                size_t j = hash_of(old[i].m_key, old[i].m_offset) & m_mask;
-                while (m_table[j].m_key) j = (j + 1) & m_mask;
-                m_table[j] = old[i];
-            }
-        }
-        free(old);
-    }
-public:
-    replace_cache() {}
-    replace_cache(replace_cache const &) = delete;
-    ~replace_cache() {
-        if (m_table) {
-            for (size_t i = 0; i <= m_mask; i++) {
-                if (m_table[i].m_key) lean_dec(m_table[i].m_value);
-            }
-            free(m_table);
-        }
-    }
-    /* Returns the cached result (borrowed) or `nullptr`. */
-    lean_object * find(lean_object * k, unsigned offset) const {
-        if (!m_table) return nullptr;
-        size_t j = hash_of(k, offset) & m_mask;
-        while (m_table[j].m_key) {
-            if (m_table[j].m_key == k && m_table[j].m_offset == offset) return m_table[j].m_value;
-            j = (j + 1) & m_mask;
-        }
-        return nullptr;
-    }
-    /* Remembers `v` (a new reference is taken) as the result for `(k, offset)`, which must not be present. */
-    void insert(lean_object * k, unsigned offset, lean_object * v) {
-        if (2 * (m_size + 1) > (m_table ? m_mask + 1 : 0)) grow();
-        size_t j = hash_of(k, offset) & m_mask;
-        while (m_table[j].m_key) {
-            if (m_table[j].m_key == k && m_table[j].m_offset == offset) return;
-            j = (j + 1) & m_mask;
-        }
-        lean_inc(v);
-        m_table[j] = { k, offset, v };
-        m_size++;
-    }
-};
-
-/* The functor type is a template parameter so that the callback can be inlined; see `replace`.
-   With `Cheap`, the callback takes constant time on the subterms it returns unchanged and returns
-   such a subterm itself; the cache is then neither consulted nor filled for those and for leaves. */
-template<typename F, bool Cheap = false>
-class replace_rec_fn_t {
-    replace_cache m_cache;
-    F const &     m_f;
-    bool          m_use_cache;
-
-    expr save_result(expr const & e, unsigned offset, expr r, bool shared) {
-        if (shared)
-            m_cache.insert(e.raw(), offset, r.raw());
-        return r;
-    }
-
-    static bool is_leaf(expr const & e) {
-        switch (e.kind()) {
-        case expr_kind::Const: case expr_kind::Sort: case expr_kind::BVar:
-        case expr_kind::Lit:   case expr_kind::MVar: case expr_kind::FVar:
-            return true;
-        default:
-            return false;
-        }
-    }
-
-    expr apply(expr const & e, unsigned offset) {
-        bool shared = false;
-        optional<expr> r;
-        if constexpr (Cheap) {
-            r = m_f(e, offset);
-            if (r) {
-                if (r->raw() == e.raw()) return std::move(*r);
-            } else if (is_leaf(e)) {
-                return e;
-            }
-        }
-        if (m_use_cache && !is_likely_unshared(e)) {
-            if (lean_object * c = m_cache.find(e.raw(), offset))
-                return expr(c, true);
-            shared = true;
-        }
-        if constexpr (!Cheap) r = m_f(e, offset);
-        if (r) {
-            return save_result(e, offset, std::move(*r), shared);
-        } else {
-            switch (e.kind()) {
-            case expr_kind::Const: case expr_kind::Sort:
-            case expr_kind::BVar:  case expr_kind::Lit:
-            case expr_kind::MVar:  case expr_kind::FVar:
-                return save_result(e, offset, e, shared);
-            case expr_kind::MData: {
-                expr new_e = apply(mdata_expr(e), offset);
-                return save_result(e, offset, update_mdata(e, new_e), shared);
-            }
-            case expr_kind::Proj: {
-                expr new_e = apply(proj_expr(e), offset);
-                return save_result(e, offset, update_proj(e, new_e), shared);
-            }
-            case expr_kind::App: {
-                expr new_f = apply(app_fn(e), offset);
-                expr new_a = apply(app_arg(e), offset);
-                return save_result(e, offset, update_app(e, new_f, new_a), shared);
-            }
-            case expr_kind::Pi: case expr_kind::Lambda: {
-                expr new_d = apply(binding_domain(e), offset);
-                expr new_b = apply(binding_body(e), offset+1);
-                return save_result(e, offset, update_binding(e, new_d, new_b), shared);
-            }
-            case expr_kind::Let: {
-                expr new_t = apply(let_type(e), offset);
-                expr new_v = apply(let_value(e), offset);
-                expr new_b = apply(let_body(e), offset+1);
-                return save_result(e, offset, update_let(e, new_t, new_v, new_b), shared);
-            }
-            }
-            lean_unreachable();
-        }
-    }
-public:
-    replace_rec_fn_t(F const & f, bool use_cache) : m_f(f), m_use_cache(use_cache) {}
-    expr operator()(expr const & e) { return apply(e, 0); }
-};
-
-/* `replace` for callbacks that satisfy the `Cheap` condition of `replace_rec_fn_t`. */
 template<typename F>
-expr replace_cheap(expr const & e, F const & f, bool use_cache = true) {
-    return replace_rec_fn_t<F, true>(f, use_cache)(e);
-}
+struct functor_replace_policy {
+    static constexpr bool only_atomic = false;
+    F const & m_f;
+    bool should_return_self(expr const &, unsigned) const { return false; }
+    expr visit_atomic(expr const & e, unsigned) const { return e; }
+    optional<expr> visit(expr const & e, unsigned offset) const {
+        return m_f(e, offset);
+    }
+};
 
-/* Overload for callbacks given as lambdas, which avoids the `std::function` indirection. */
 template<typename F>
 requires std::is_invocable_r_v<optional<expr>, F const &, expr const &, unsigned> &&
          (!std::is_same_v<std::remove_cvref_t<F>, std::function<optional<expr>(expr const &, unsigned)>>)
-expr replace(expr const & e, F const & f, bool use_cache = true) {
-    return replace_rec_fn_t<F>(f, use_cache)(e);
+inline expr replace(expr const & e, F const & f, bool use_cache = true) {
+    return replace_custom(e, functor_replace_policy<F>{f}, use_cache);
 }
 }

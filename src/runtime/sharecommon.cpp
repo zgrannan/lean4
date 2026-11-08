@@ -321,22 +321,229 @@ static inline void inc_st(lean_object * o) {
 #endif
 }
 
+struct sharecommon_table_pool {
+    struct ptr_map_buf {
+        sharecommon_quick_fn::flat_ptr_map::slot * slots;
+        size_t cap;
+        uint32_t * used;
+        size_t used_cap;
+    };
+    struct obj_set_buf {
+        sharecommon_quick_fn::flat_obj_set::slot * slots;
+        size_t cap;
+        uint32_t * used;
+        size_t used_cap;
+    };
+    std::vector<ptr_map_buf> m_map_pool;
+    std::vector<obj_set_buf> m_set_pool;
+
+    ~sharecommon_table_pool() {
+        for (auto & b : m_map_pool) {
+            delete[] b.slots;
+            delete[] b.used;
+        }
+        for (auto & b : m_set_pool) {
+            delete[] b.slots;
+            delete[] b.used;
+        }
+    }
+};
+
+static thread_local sharecommon_table_pool g_sharecommon_pool;
+
+sharecommon_quick_fn::flat_ptr_map::flat_ptr_map() {
+    if (!g_sharecommon_pool.m_map_pool.empty()) {
+        auto b = g_sharecommon_pool.m_map_pool.back();
+        g_sharecommon_pool.m_map_pool.pop_back();
+        m_slots = b.slots;
+        m_cap = b.cap;
+        m_used = b.used;
+        m_used_cap = b.used_cap;
+    } else {
+        m_cap = 2048;
+        m_slots = new slot[m_cap]();
+        m_used_cap = 1024;
+        m_used = new uint32_t[m_used_cap];
+    }
+    m_sz = 0;
+}
+
+sharecommon_quick_fn::flat_ptr_map::~flat_ptr_map() {
+    if (m_sz * 4 < m_cap) {
+        for (size_t i = 0; i < m_sz; ++i) {
+            m_slots[m_used[i]].key = nullptr;
+        }
+    } else {
+        memset(m_slots, 0, m_cap * sizeof(slot));
+    }
+    if (m_cap <= 262144 && g_sharecommon_pool.m_map_pool.size() < 8) {
+        g_sharecommon_pool.m_map_pool.push_back({m_slots, m_cap, m_used, m_used_cap});
+    } else {
+        delete[] m_slots;
+        delete[] m_used;
+    }
+}
+
+inline lean_object * sharecommon_quick_fn::flat_ptr_map::find(lean_object * k) const {
+    size_t mask = m_cap - 1;
+    size_t idx = (((uintptr_t)k >> 3) * 11400714819323198485ULL >> 32) & mask;
+    while (true) {
+        slot const & s = m_slots[idx];
+        if (!s.key) return nullptr;
+        if (s.key == k) return s.val;
+        idx = (idx + 1) & mask;
+    }
+}
+
+void sharecommon_quick_fn::flat_ptr_map::grow() {
+    size_t new_cap = m_cap * 2;
+    slot * new_slots = new slot[new_cap]();
+    size_t new_used_cap = new_cap / 2;
+    uint32_t * new_used = new uint32_t[new_used_cap];
+    size_t mask = new_cap - 1;
+    for (size_t i = 0; i < m_sz; ++i) {
+        slot const & old_s = m_slots[m_used[i]];
+        size_t idx = (((uintptr_t)old_s.key >> 3) * 11400714819323198485ULL >> 32) & mask;
+        while (new_slots[idx].key) {
+            idx = (idx + 1) & mask;
+        }
+        new_slots[idx] = old_s;
+        new_used[i] = static_cast<uint32_t>(idx);
+    }
+    delete[] m_slots;
+    delete[] m_used;
+    m_slots = new_slots;
+    m_cap = new_cap;
+    m_used = new_used;
+    m_used_cap = new_used_cap;
+}
+
+inline void sharecommon_quick_fn::flat_ptr_map::insert(lean_object * k, lean_object * v) {
+    if (LEAN_UNLIKELY((m_sz + 1) * 2 >= m_cap)) {
+        grow();
+    }
+    size_t mask = m_cap - 1;
+    size_t idx = (((uintptr_t)k >> 3) * 11400714819323198485ULL >> 32) & mask;
+    while (true) {
+        slot & s = m_slots[idx];
+        if (!s.key) {
+            s.key = k;
+            s.val = v;
+            m_used[m_sz++] = static_cast<uint32_t>(idx);
+            return;
+        }
+        if (s.key == k) {
+            s.val = v;
+            return;
+        }
+        idx = (idx + 1) & mask;
+    }
+}
+
+sharecommon_quick_fn::flat_obj_set::flat_obj_set() {
+    if (!g_sharecommon_pool.m_set_pool.empty()) {
+        auto b = g_sharecommon_pool.m_set_pool.back();
+        g_sharecommon_pool.m_set_pool.pop_back();
+        m_slots = b.slots;
+        m_cap = b.cap;
+        m_used = b.used;
+        m_used_cap = b.used_cap;
+    } else {
+        m_cap = 2048;
+        m_slots = new slot[m_cap]();
+        m_used_cap = 1024;
+        m_used = new uint32_t[m_used_cap];
+    }
+    m_sz = 0;
+}
+
+sharecommon_quick_fn::flat_obj_set::~flat_obj_set() {
+    if (m_sz * 4 < m_cap) {
+        for (size_t i = 0; i < m_sz; ++i) {
+            m_slots[m_used[i]].obj = nullptr;
+        }
+    } else {
+        memset(m_slots, 0, m_cap * sizeof(slot));
+    }
+    if (m_cap <= 262144 && g_sharecommon_pool.m_set_pool.size() < 8) {
+        g_sharecommon_pool.m_set_pool.push_back({m_slots, m_cap, m_used, m_used_cap});
+    } else {
+        delete[] m_slots;
+        delete[] m_used;
+    }
+}
+
+inline lean_object * sharecommon_quick_fn::flat_obj_set::find_with_hash(lean_object * o, uint32_t h) const {
+    size_t mask = m_cap - 1;
+    size_t idx = h & mask;
+    while (true) {
+        slot const & s = m_slots[idx];
+        if (!s.obj) return nullptr;
+        if (s.hash == h && (s.obj == o || lean_sharecommon_eq(s.obj, o))) {
+            return s.obj;
+        }
+        idx = (idx + 1) & mask;
+    }
+}
+
+inline lean_object * sharecommon_quick_fn::flat_obj_set::find(lean_object * o) const {
+    return find_with_hash(o, static_cast<uint32_t>(lean_sharecommon_hash(o)));
+}
+
+void sharecommon_quick_fn::flat_obj_set::grow() {
+    size_t new_cap = m_cap * 2;
+    slot * new_slots = new slot[new_cap]();
+    size_t new_used_cap = new_cap / 2;
+    uint32_t * new_used = new uint32_t[new_used_cap];
+    size_t mask = new_cap - 1;
+    for (size_t i = 0; i < m_sz; ++i) {
+        slot const & old_s = m_slots[m_used[i]];
+        size_t idx = old_s.hash & mask;
+        while (new_slots[idx].obj) {
+            idx = (idx + 1) & mask;
+        }
+        new_slots[idx] = old_s;
+        new_used[i] = static_cast<uint32_t>(idx);
+    }
+    delete[] m_slots;
+    delete[] m_used;
+    m_slots = new_slots;
+    m_cap = new_cap;
+    m_used = new_used;
+    m_used_cap = new_used_cap;
+}
+
+inline void sharecommon_quick_fn::flat_obj_set::insert_with_hash(lean_object * o, uint32_t h) {
+    if (LEAN_UNLIKELY((m_sz + 1) * 2 >= m_cap)) {
+        grow();
+    }
+    size_t mask = m_cap - 1;
+    size_t idx = h & mask;
+    while (m_slots[idx].obj) {
+        idx = (idx + 1) & mask;
+    }
+    m_slots[idx].obj = o;
+    m_slots[idx].hash = h;
+    m_used[m_sz++] = static_cast<uint32_t>(idx);
+}
+
+inline void sharecommon_quick_fn::flat_obj_set::insert(lean_object * o) {
+    insert_with_hash(o, static_cast<uint32_t>(lean_sharecommon_hash(o)));
+}
+
 lean_object * sharecommon_quick_fn::check_cache(lean_object * a) {
     if (!lean_is_exclusive(a)) {
         // We only check the cache if `a` is a shared object
-        auto it = m_cache.find(a);
-        if (it != m_cache.end()) {
+        if (lean_object * r = m_cache.find(a)) {
             // All objects stored in the range of `m_cache` are single threaded.
-            lean_assert(lean_is_st(it->second));
+            lean_assert(lean_is_st(r));
             // We increment the reference counter because this object
             // will be returned by `lean_sharecommon_quick` or stored into a new object.
-            inc_st(it->second);
-            return it->second;
+            inc_st(r);
+            return r;
         }
         if (m_check_set) {
-            auto it = m_set.find(a);
-            if (it != m_set.end()) {
-                lean_object * result = *it;
+            if (lean_object * result = m_set.find(a)) {
                 lean_assert(lean_is_st(result));
                 inc_st(result);
                 return result;
@@ -352,15 +559,16 @@ lean_object * sharecommon_quick_fn::check_cache(lean_object * a) {
 lean_object * sharecommon_quick_fn::save(lean_object * a, lean_object * new_a) {
     lean_assert(lean_is_st(new_a));
     lean_assert(lean_internal_get_rc(new_a) == 1);
-    auto it = m_set.find(new_a);
+    uint32_t h = static_cast<uint32_t>(lean_sharecommon_hash(new_a));
+    lean_object * existing = m_set.find_with_hash(new_a, h);
     lean_object * result;
-    if (it == m_set.end()) {
+    if (existing == nullptr) {
         // `new_a` is a new object
-        m_set.insert(new_a);
+        m_set.insert_with_hash(new_a, h);
         result = new_a;
     } else {
         // We already have a maximally shared object that is equal to `new_a`
-        result = *it;
+        result = existing;
         DEBUG_CODE({
                 if (lean_is_ctor(new_a)) {
                     lean_assert(lean_is_ctor(result));
@@ -379,7 +587,7 @@ lean_object * sharecommon_quick_fn::save(lean_object * a, lean_object * new_a) {
     }
     if (!lean_is_exclusive(a)) {
         // We only cache the result if `a` is a shared object.
-        m_cache.insert(std::make_pair(a, result));
+        m_cache.insert(a, result);
     }
     lean_assert(result == new_a || lean_internal_get_rc(result) > 1);
     lean_assert(result != new_a || lean_internal_get_rc(result) == 1);
@@ -388,11 +596,11 @@ lean_object * sharecommon_quick_fn::save(lean_object * a, lean_object * new_a) {
 
 // `sarray` and `string`
 lean_object * sharecommon_quick_fn::visit_terminal(lean_object * a) {
-    auto it = m_set.find(a);
-    if (it == m_set.end()) {
-        m_set.insert(a);
+    uint32_t h = static_cast<uint32_t>(lean_sharecommon_hash(a));
+    if (lean_object * existing = m_set.find_with_hash(a, h)) {
+        a = existing;
     } else {
-        a = *it;
+        m_set.insert_with_hash(a, h);
     }
     lean_inc_ref(a);
     return a;
@@ -418,6 +626,36 @@ lean_object * sharecommon_quick_fn::visit_ctor(lean_object * a) {
     unsigned sz            = lean_object_byte_size(a);
     unsigned scalar_offset = sizeof(lean_object) + num_objs*sizeof(void*);
     unsigned scalar_sz     = sz - scalar_offset;
+    if (LEAN_LIKELY(sz <= 64)) {
+        alignas(8) char tmp_buf[64];
+        lean_object * tmp = reinterpret_cast<lean_object *>(tmp_buf);
+        lean_set_non_heap_header(tmp, sz, tag, num_objs);
+        for (unsigned i = 0; i < num_objs; i++) {
+            lean_ctor_set(tmp, i, visit(lean_ctor_get(a, i)));
+        }
+        if (scalar_sz > 0) {
+            memcpy(tmp_buf + scalar_offset, reinterpret_cast<char const *>(a) + scalar_offset, scalar_sz);
+        }
+        uint32_t h = static_cast<uint32_t>(lean_sharecommon_hash(tmp));
+        if (lean_object * existing = m_set.find_with_hash(tmp, h)) {
+            for (unsigned i = 0; i < num_objs; i++) {
+                lean_dec(lean_ctor_get(tmp, i));
+            }
+            inc_st(existing);
+            if (!lean_is_exclusive(a)) {
+                m_cache.insert(a, existing);
+            }
+            return existing;
+        }
+        lean_object * new_a = lean_alloc_small_object(sz);
+        lean_set_st_header(new_a, tag, num_objs);
+        memcpy(reinterpret_cast<char *>(new_a) + sizeof(lean_object), tmp_buf + sizeof(lean_object), sz - sizeof(lean_object));
+        m_set.insert_with_hash(new_a, h);
+        if (!lean_is_exclusive(a)) {
+            m_cache.insert(a, new_a);
+        }
+        return new_a;
+    }
     lean_object * new_a    = lean_alloc_ctor(tag, num_objs, scalar_sz);
     for (unsigned i = 0; i < num_objs; i++) {
         lean_ctor_set(new_a, i, visit(lean_ctor_get(a, i)));

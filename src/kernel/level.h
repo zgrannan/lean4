@@ -46,7 +46,10 @@ public:
     level_kind kind() const {
       return lean_is_scalar(raw()) ? level_kind::Zero : static_cast<level_kind>(lean_ptr_tag(raw()));
     }
-    unsigned hash() const;
+    uint64_t get_data() const {
+        return lean_is_scalar(raw()) ? 2221ULL : lean_ctor_get_uint64(raw(), lean_ctor_num_objs(raw()) * sizeof(object*));
+    }
+    unsigned hash() const { return static_cast<unsigned>(get_data()); }
 
     level & operator=(level const & other) { object_ref::operator=(other); return *this; }
     level & operator=(level && other) noexcept { object_ref::operator=(std::move(other)); return *this; }
@@ -109,7 +112,7 @@ inline bool is_max(level const & l)    { return l.is_max(); }
 inline bool is_imax(level const & l)   { return l.is_imax(); }
 bool is_one(level const & l);
 
-unsigned get_depth(level const & l);
+inline unsigned get_depth(level const & l) { return static_cast<unsigned>(l.get_data() >> 40); }
 
 /** \brief Return true iff \c l is an explicit level.
     We say a level l is explicit iff
@@ -117,9 +120,9 @@ unsigned get_depth(level const & l);
     2) l = succ(l') and l' is explicit */
 bool is_explicit(level const & l);
 /** \brief Return true iff \c l contains placeholder (aka meta parameters). */
-bool has_mvar(level const & l);
+inline bool has_mvar(level const & l) { return ((l.get_data() >> 32) & 1) == 1; }
 /** \brief Return true iff \c l contains parameters */
-bool has_param(level const & l);
+inline bool has_param(level const & l) { return ((l.get_data() >> 33) & 1) == 1; }
 
 /** \brief Return a new level expression based on <tt>l == succ(arg)</tt>, where \c arg is replaced with
     \c new_arg.

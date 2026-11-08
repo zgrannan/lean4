@@ -48,23 +48,8 @@ bool operator<(literal const & a, literal const & b) {
     lean_unreachable();
 }
 
-bool is_atomic(expr const & e) {
-    switch (e.kind()) {
-    case expr_kind::Const: case expr_kind::Sort:
-    case expr_kind::BVar:  case expr_kind::Lit:
-    case expr_kind::MVar:  case expr_kind::FVar:
-        return true;
-    case expr_kind::App:
-    case expr_kind::Lambda:
-    case expr_kind::Pi:    case expr_kind::Let:
-    case expr_kind::MData: case expr_kind::Proj:
-        return false;
-    }
-    lean_unreachable(); // LCOV_EXCL_LINE
-}
-
 extern "C" uint8 lean_expr_binder_info(object * e);
-binder_info binding_info(expr const & e) { return static_cast<binder_info>(lean_expr_binder_info(e.to_obj_arg())); }
+binder_info binding_info_core(expr const & e) { return static_cast<binder_info>(lean_expr_binder_info(e.to_obj_arg())); }
 
 extern "C" object * lean_lit_type(obj_arg e);
 expr lit_type(literal const & lit) { return expr(lean_lit_type(lit.to_obj_arg())); }
@@ -88,8 +73,10 @@ extern "C" uint8 lean_expr_has_level_mvar(obj_arg e);
 bool has_univ_mvar_core(expr const & e) { return lean_expr_has_level_mvar(e.to_obj_arg()); }
 
 extern "C" uint8 lean_expr_has_level_param(obj_arg e);
-bool has_univ_param(expr const & e) { return lean_expr_has_level_param(e.to_obj_arg()); }
+bool has_univ_param_core(expr const & e) { return lean_expr_has_level_param(e.to_obj_arg()); }
 
+extern "C" unsigned lean_expr_loose_bvar_range(object * e);
+unsigned get_loose_bvar_range_core(expr const & e) { return lean_expr_loose_bvar_range(e.to_obj_arg()); }
 
 extern "C" LEAN_EXPORT uint64_t lean_expr_mk_data(uint64_t hash, object * bvarRange, uint32_t approxDepth, uint8_t hasFVar, uint8_t hasExprMVar, uint8_t hasLevelMVar, uint8_t hasLevelParam) {
     if (approxDepth > 255) approxDepth = 255;
@@ -114,15 +101,273 @@ extern "C" LEAN_EXPORT uint64_t lean_expr_mk_app_data(uint64_t fData, uint64_t a
   return ((fData | aData) & (((uint64_t) 15) << 40)) | ((uint64_t) h) | (((uint64_t) depth) << 32) | (((uint64_t) range) << 44);
 }
 
+static inline uint64_t mk_binding_data(uint64_t tData, uint64_t eData) {
+    uint32_t d_raw = std::max<uint32_t>(get_approx_depth(tData), get_approx_depth(eData)) + 1;
+    uint32_t d = d_raw > 255 ? 255 : d_raw;
+    uint32_t b_r = get_bvar_range(eData);
+    uint32_t r = std::max<uint32_t>(get_bvar_range(tData), b_r > 0 ? b_r - 1 : 0u);
+    uint32_t h = static_cast<uint32_t>(lean_uint64_mix_hash(d_raw, lean_uint64_mix_hash(static_cast<uint32_t>(tData), static_cast<uint32_t>(eData))));
+    return ((tData | eData) & (15ULL << 40)) | static_cast<uint64_t>(h) | (static_cast<uint64_t>(d) << 32) | (static_cast<uint64_t>(r) << 44);
+}
+
+static inline uint64_t mk_let_data(uint64_t tData, uint64_t vData, uint64_t bData) {
+    uint32_t d_raw = std::max<uint32_t>({get_approx_depth(tData), get_approx_depth(vData), get_approx_depth(bData)}) + 1;
+    uint32_t d = d_raw > 255 ? 255 : d_raw;
+    uint32_t b_r = get_bvar_range(bData);
+    uint32_t r = std::max<uint32_t>({get_bvar_range(tData), get_bvar_range(vData), b_r > 0 ? b_r - 1 : 0u});
+    uint32_t h = static_cast<uint32_t>(lean_uint64_mix_hash(d_raw, lean_uint64_mix_hash(static_cast<uint32_t>(tData), lean_uint64_mix_hash(static_cast<uint32_t>(vData), static_cast<uint32_t>(bData)))));
+    return ((tData | vData | bData) & (15ULL << 40)) | static_cast<uint64_t>(h) | (static_cast<uint64_t>(d) << 32) | (static_cast<uint64_t>(r) << 44);
+}
+
+static inline uint64_t mk_fvar_data(name const & n) {
+    uint32_t h = static_cast<uint32_t>(lean_uint64_mix_hash(13ULL, n.hash()));
+    return static_cast<uint64_t>(h) | (1ULL << 40);
+}
+
+static inline uint64_t mk_sort_data(level const & l) {
+    uint32_t h = static_cast<uint32_t>(lean_uint64_mix_hash(11ULL, l.hash()));
+    uint64_t hasLevelMVar = has_mvar(l) ? 1ULL : 0ULL;
+    uint64_t hasLevelParam = has_param(l) ? 1ULL : 0ULL;
+    return static_cast<uint64_t>(h) | (hasLevelMVar << 42) | (hasLevelParam << 43);
+}
+
+static inline uint64_t mk_const_data(name const & n, levels const & ls) {
+    uint64_t lh = 7ULL;
+    uint64_t hasLevelMVar = 0;
+    uint64_t hasLevelParam = 0;
+    for (object * it = ls.raw(); !lean_is_scalar(it); it = lean_ctor_get(it, 1)) {
+        level const & head = static_cast<level const &>(cnstr_get_ref(it, 0));
+        lh = lean_uint64_mix_hash(lh, head.hash());
+        if (has_mvar(head)) hasLevelMVar = 1;
+        if (has_param(head)) hasLevelParam = 1;
+    }
+    uint32_t h = static_cast<uint32_t>(lean_uint64_mix_hash(5ULL, lean_uint64_mix_hash(n.hash(), lh)));
+    return static_cast<uint64_t>(h) | (hasLevelMVar << 42) | (hasLevelParam << 43);
+}
+
+static inline uint64_t mk_mdata_data(uint64_t eData) {
+    uint32_t d_raw = static_cast<uint32_t>(get_approx_depth(eData)) + 1;
+    uint32_t d = d_raw > 255 ? 255 : d_raw;
+    uint32_t r = get_bvar_range(eData);
+    uint32_t h = static_cast<uint32_t>(lean_uint64_mix_hash(d_raw, static_cast<uint32_t>(eData)));
+    return (eData & (15ULL << 40)) | static_cast<uint64_t>(h) | (static_cast<uint64_t>(d) << 32) | (static_cast<uint64_t>(r) << 44);
+}
+
+static inline uint64_t mk_proj_data(name const & s, nat const & idx, uint64_t eData) {
+    uint32_t d_raw = static_cast<uint32_t>(get_approx_depth(eData)) + 1;
+    uint32_t d = d_raw > 255 ? 255 : d_raw;
+    uint32_t r = get_bvar_range(eData);
+    uint64_t idx_u64 = idx.is_small() ? static_cast<uint64_t>(idx.get_small_value()) : lean_uint64_of_nat(idx.raw());
+    uint32_t h = static_cast<uint32_t>(lean_uint64_mix_hash(d_raw, lean_uint64_mix_hash(s.hash(), lean_uint64_mix_hash(idx_u64, static_cast<uint32_t>(eData)))));
+    return (eData & (15ULL << 40)) | static_cast<uint64_t>(h) | (static_cast<uint64_t>(d) << 32) | (static_cast<uint64_t>(r) << 44);
+}
+
+// =======================================
+// Kernel Scoped Bump Arena
+// =======================================
+
+struct kernel_arena {
+    static constexpr size_t SLAB_SIZE = 1u << 20;       // 1 MB per slab
+    static constexpr size_t MAX_ARENA_BYTES = 64u << 20; // 64 MB cap per declaration
+    static constexpr size_t TRACKED_MASK = 1023;
+
+    struct tracked_entry {
+        object * m_ptr = nullptr;
+        uint32_t m_epoch = 0;
+    };
+
+    std::vector<char *> m_slabs;
+    size_t m_curr_slab = 0;
+    size_t m_offset = 0;
+    size_t m_used_bytes = 0;
+    size_t m_peak_bytes = 0;
+    size_t m_total_alloc_bytes = 0;
+    size_t m_total_scopes = 0;
+    unsigned m_depth = 0;
+    bool m_active = false;
+    bool m_retain_on_exit = false;
+    uint32_t m_epoch = 1;
+    tracked_entry m_tracked[TRACKED_MASK + 1];
+    std::vector<object *> m_heap_refs;
+    std::vector<char *> m_retained_slabs;
+    std::vector<object *> m_retained_heap_refs;
+
+    ~kernel_arena() {
+        if (getenv("LEAN_PRINT_ARENA_STATS") && m_total_scopes > 0) {
+            fprintf(stderr, "[kernel_arena] scopes=%zu peak_bytes=%zu (%.2f KB) total_alloc_bytes=%zu (%.2f MB)\n",
+                    m_total_scopes, m_peak_bytes, m_peak_bytes / 1024.0,
+                    m_total_alloc_bytes, m_total_alloc_bytes / (1024.0 * 1024.0));
+        }
+        for (object * o : m_heap_refs) lean_dec_ref(o);
+        for (object * o : m_retained_heap_refs) lean_dec_ref(o);
+        for (char * s : m_slabs) delete[] s;
+        for (char * s : m_retained_slabs) delete[] s;
+    }
+
+    inline void next_epoch() {
+        ++m_epoch;
+        if (LEAN_UNLIKELY(m_epoch == 0)) {
+            for (size_t i = 0; i <= TRACKED_MASK; ++i) {
+                m_tracked[i].m_epoch = 0;
+            }
+            m_epoch = 1;
+        }
+    }
+
+    inline object * alloc_ctor(unsigned tag, unsigned num_objs, size_t total_sz) {
+        if (LEAN_UNLIKELY(m_used_bytes + total_sz > MAX_ARENA_BYTES)) {
+            return nullptr;
+        }
+        if (LEAN_UNLIKELY(m_slabs.empty())) {
+            m_slabs.push_back(new char[SLAB_SIZE]);
+            m_curr_slab = 0;
+            m_offset = 0;
+        }
+        if (LEAN_UNLIKELY(m_offset + total_sz > SLAB_SIZE)) {
+            ++m_curr_slab;
+            if (m_curr_slab >= m_slabs.size()) {
+                m_slabs.push_back(new char[SLAB_SIZE]);
+            }
+            m_offset = 0;
+        }
+        object * o = reinterpret_cast<object *>(m_slabs[m_curr_slab] + m_offset);
+        m_offset += total_sz;
+        m_used_bytes += total_sz;
+        lean_set_non_heap_header(o, total_sz, tag, num_objs);
+        return o;
+    }
+
+    inline void track_child(object * c) {
+        if (!lean_is_scalar(c) && lean_has_rc(c)) {
+            size_t idx = (reinterpret_cast<uintptr_t>(c) >> 3) & TRACKED_MASK;
+            if (m_tracked[idx].m_ptr == c && m_tracked[idx].m_epoch == m_epoch && lean_internal_get_rc(c) != 1) {
+                return;
+            }
+            m_tracked[idx].m_ptr = c;
+            m_tracked[idx].m_epoch = m_epoch;
+            lean_inc_ref(c);
+            m_heap_refs.push_back(c);
+        }
+    }
+
+    bool in_current_slabs(object * o) const {
+        if (lean_is_scalar(o) || m_slabs.empty() || m_used_bytes == 0) return false;
+        uintptr_t p = reinterpret_cast<uintptr_t>(o);
+        for (size_t i = 0; i <= m_curr_slab && i < m_slabs.size(); ++i) {
+            uintptr_t base = reinterpret_cast<uintptr_t>(m_slabs[i]);
+            if (p >= base && p < base + SLAB_SIZE) return true;
+        }
+        return false;
+    }
+
+    void reset() {
+        if (m_used_bytes > m_peak_bytes) {
+            m_peak_bytes = m_used_bytes;
+        }
+        m_total_alloc_bytes += m_used_bytes;
+        ++m_total_scopes;
+        if (LEAN_UNLIKELY(m_retain_on_exit)) {
+            for (size_t i = 0; i <= m_curr_slab && i < m_slabs.size(); ++i) {
+                m_retained_slabs.push_back(m_slabs[i]);
+            }
+            m_slabs.erase(m_slabs.begin(), m_slabs.begin() + std::min(m_curr_slab + 1, m_slabs.size()));
+            m_retained_heap_refs.insert(m_retained_heap_refs.end(), m_heap_refs.begin(), m_heap_refs.end());
+            m_heap_refs.clear();
+            m_retain_on_exit = false;
+        } else {
+            for (object * o : m_heap_refs) {
+                lean_dec_ref(o);
+            }
+            m_heap_refs.clear();
+        }
+        m_curr_slab = 0;
+        m_offset = 0;
+        m_used_bytes = 0;
+        next_epoch();
+    }
+};
+
+static thread_local kernel_arena g_kernel_arena;
+
+kernel_arena_scope::kernel_arena_scope() {
+    m_outermost = (g_kernel_arena.m_depth == 0);
+    ++g_kernel_arena.m_depth;
+    if (m_outermost) {
+        g_kernel_arena.m_active = true;
+    }
+}
+
+kernel_arena_scope::~kernel_arena_scope() {
+    --g_kernel_arena.m_depth;
+    if (m_outermost) {
+        g_kernel_arena.m_active = false;
+        g_kernel_arena.reset();
+    }
+}
+
+kernel_arena_pause_scope::kernel_arena_pause_scope() {
+    m_prev_active = g_kernel_arena.m_active;
+    g_kernel_arena.m_active = false;
+}
+
+kernel_arena_pause_scope::~kernel_arena_pause_scope() {
+    g_kernel_arena.m_active = m_prev_active;
+}
+
+void kernel_arena_retain_on_exception() {
+    if (g_kernel_arena.m_depth > 0 && g_kernel_arena.m_used_bytes > 0) {
+        g_kernel_arena.m_retain_on_exit = true;
+    }
+}
+
+static expr promote_rec(expr const & e) {
+    if (!g_kernel_arena.in_current_slabs(e.raw())) {
+        return e;
+    }
+    switch (e.kind()) {
+    case expr_kind::BVar:   return mk_bvar(bvar_idx(e));
+    case expr_kind::FVar:   return mk_fvar(fvar_name(e));
+    case expr_kind::MVar:   return e;
+    case expr_kind::Sort:   return mk_sort(sort_level(e));
+    case expr_kind::Const:  return mk_const(const_name(e), const_levels(e));
+    case expr_kind::App:    return mk_app(promote_rec(app_fn(e)), promote_rec(app_arg(e)));
+    case expr_kind::Lambda: return mk_lambda(binding_name(e), promote_rec(binding_domain(e)), promote_rec(binding_body(e)), binding_info(e));
+    case expr_kind::Pi:     return mk_pi(binding_name(e), promote_rec(binding_domain(e)), promote_rec(binding_body(e)), binding_info(e));
+    case expr_kind::Let:    return mk_let(let_name(e), promote_rec(let_type(e)), promote_rec(let_value(e)), promote_rec(let_body(e)), let_nondep(e));
+    case expr_kind::Lit:    return mk_lit(lit_value(e));
+    case expr_kind::MData:  return mk_mdata(mdata_data(e), promote_rec(mdata_expr(e)));
+    case expr_kind::Proj:   return mk_proj(proj_sname(e), proj_idx(e), promote_rec(proj_expr(e)));
+    }
+    lean_unreachable();
+}
+
+expr kernel_arena_promote(expr const & e) {
+    kernel_arena_retain_on_exception();
+    if (g_kernel_arena.m_used_bytes == 0) return e;
+    kernel_arena_pause_scope pause;
+    return promote_rec(e);
+}
+
+kernel_arena_stats get_kernel_arena_stats() {
+    return kernel_arena_stats{
+        g_kernel_arena.m_peak_bytes,
+        g_kernel_arena.m_total_alloc_bytes,
+        g_kernel_arena.m_total_scopes
+    };
+}
+
 // =======================================
 // Constructors
+
+static constexpr size_t NUM_STATIC_BVARS = 1024;
+static object * g_bvars[NUM_STATIC_BVARS] = {nullptr};
 
 static expr * g_dummy = nullptr;
 
 static expr const & get_dummy() {
     if (!g_dummy) {
         g_dummy = new expr(mk_constant("__expr_for_default_constructor__"));
-    mark_persistent(g_dummy->raw());
+        mark_persistent(g_dummy->raw());
     }
     return *g_dummy;
 }
@@ -133,34 +378,181 @@ extern "C" object * lean_expr_mk_lit(obj_arg l);
 expr mk_lit(literal const & l) { return expr(lean_expr_mk_lit(l.to_obj_arg())); }
 
 extern "C" object * lean_expr_mk_mdata(obj_arg m, obj_arg e);
-expr mk_mdata(kvmap const & m, expr const & e) { return expr(lean_expr_mk_mdata(m.to_obj_arg(), e.to_obj_arg())); }
+expr mk_mdata(kvmap const & m, expr const & e) {
+    uint64_t data = mk_mdata_data(get_data(e));
+    if (g_kernel_arena.m_active) {
+        if (object * o = g_kernel_arena.alloc_ctor(10, 2, 32)) {
+            g_kernel_arena.track_child(m.raw());
+            g_kernel_arena.track_child(e.raw());
+            lean_ctor_set(o, 0, m.raw());
+            lean_ctor_set(o, 1, e.raw());
+            lean_ctor_set_uint64(o, sizeof(void*)*2, data);
+            return expr(o);
+        }
+    }
+    object * o = lean_alloc_ctor(10, 2, 8);
+    lean_ctor_set(o, 0, m.to_obj_arg());
+    lean_ctor_set(o, 1, e.to_obj_arg());
+    lean_ctor_set_uint64(o, sizeof(void*)*2, data);
+    return expr(o);
+}
 
 extern "C" object * lean_expr_mk_proj(obj_arg s, obj_arg idx, obj_arg e);
-expr mk_proj(name const & s, nat const & idx, expr const & e) { return expr(lean_expr_mk_proj(s.to_obj_arg(), idx.to_obj_arg(), e.to_obj_arg())); }
+expr mk_proj(name const & s, nat const & idx, expr const & e) {
+    uint64_t data = mk_proj_data(s, idx, get_data(e));
+    if (g_kernel_arena.m_active) {
+        if (object * o = g_kernel_arena.alloc_ctor(11, 3, 40)) {
+            g_kernel_arena.track_child(s.raw());
+            g_kernel_arena.track_child(idx.raw());
+            g_kernel_arena.track_child(e.raw());
+            lean_ctor_set(o, 0, s.raw());
+            lean_ctor_set(o, 1, idx.raw());
+            lean_ctor_set(o, 2, e.raw());
+            lean_ctor_set_uint64(o, sizeof(void*)*3, data);
+            return expr(o);
+        }
+    }
+    object * o = lean_alloc_ctor(11, 3, 8);
+    lean_ctor_set(o, 0, s.to_obj_arg());
+    lean_ctor_set(o, 1, idx.to_obj_arg());
+    lean_ctor_set(o, 2, e.to_obj_arg());
+    lean_ctor_set_uint64(o, sizeof(void*)*3, data);
+    return expr(o);
+}
 
 extern "C" object * lean_expr_mk_bvar(obj_arg idx);
-expr mk_bvar(nat const & idx) { return expr(lean_expr_mk_bvar(idx.to_obj_arg())); }
+expr mk_bvar(nat const & idx) {
+    if (LEAN_LIKELY(idx.is_small())) {
+        size_t v = idx.get_small_value();
+        if (LEAN_LIKELY(v < NUM_STATIC_BVARS && g_bvars[v] != nullptr)) {
+            return expr(g_bvars[v]);
+        }
+    }
+    return expr(lean_expr_mk_bvar(idx.to_obj_arg()));
+}
 
 extern "C" object * lean_expr_mk_fvar(obj_arg n);
-expr mk_fvar(name const & n) { return expr(lean_expr_mk_fvar(n.to_obj_arg())); }
+expr mk_fvar(name const & n) {
+    uint64_t data = mk_fvar_data(n);
+    if (g_kernel_arena.m_active) {
+        if (object * o = g_kernel_arena.alloc_ctor(1, 1, 24)) {
+            g_kernel_arena.track_child(n.raw());
+            lean_ctor_set(o, 0, n.raw());
+            lean_ctor_set_uint64(o, sizeof(void*)*1, data);
+            return expr(o);
+        }
+    }
+    object * o = lean_alloc_ctor(1, 1, 8);
+    lean_ctor_set(o, 0, n.to_obj_arg());
+    lean_ctor_set_uint64(o, sizeof(void*)*1, data);
+    return expr(o);
+}
 
 extern "C" object * lean_expr_mk_const(obj_arg n, obj_arg ls);
-expr mk_const(name const & n, levels const & ls) { return expr(lean_expr_mk_const(n.to_obj_arg(), ls.to_obj_arg())); }
+expr mk_const(name const & n, levels const & ls) {
+    uint64_t data = mk_const_data(n, ls);
+    if (g_kernel_arena.m_active) {
+        if (object * o = g_kernel_arena.alloc_ctor(4, 2, 32)) {
+            g_kernel_arena.track_child(n.raw());
+            g_kernel_arena.track_child(ls.raw());
+            lean_ctor_set(o, 0, n.raw());
+            lean_ctor_set(o, 1, ls.raw());
+            lean_ctor_set_uint64(o, sizeof(void*)*2, data);
+            return expr(o);
+        }
+    }
+    object * o = lean_alloc_ctor(4, 2, 8);
+    lean_ctor_set(o, 0, n.to_obj_arg());
+    lean_ctor_set(o, 1, ls.to_obj_arg());
+    lean_ctor_set_uint64(o, sizeof(void*)*2, data);
+    return expr(o);
+}
 
 extern "C" object * lean_expr_mk_app(obj_arg f, obj_arg a);
-expr mk_app(expr const & f, expr const & a) { return expr(lean_expr_mk_app(f.to_obj_arg(), a.to_obj_arg())); }
+expr mk_app(expr const & f, expr const & a) {
+    uint64_t data = lean_expr_mk_app_data(get_data(f), get_data(a));
+    if (g_kernel_arena.m_active) {
+        if (object * o = g_kernel_arena.alloc_ctor(5, 2, 32)) {
+            g_kernel_arena.track_child(f.raw());
+            g_kernel_arena.track_child(a.raw());
+            lean_ctor_set(o, 0, f.raw());
+            lean_ctor_set(o, 1, a.raw());
+            lean_ctor_set_uint64(o, sizeof(void*)*2, data);
+            return expr(o);
+        }
+    }
+    object * o = lean_alloc_ctor(5, 2, 8);
+    lean_ctor_set(o, 0, f.to_obj_arg());
+    lean_ctor_set(o, 1, a.to_obj_arg());
+    lean_ctor_set_uint64(o, sizeof(void*)*2, data);
+    return expr(o);
+}
 
 extern "C" object * lean_expr_mk_sort(obj_arg l);
-expr mk_sort(level const & l) { return expr(lean_expr_mk_sort(l.to_obj_arg())); }
+expr mk_sort(level const & l) {
+    uint64_t data = mk_sort_data(l);
+    if (g_kernel_arena.m_active) {
+        if (object * o = g_kernel_arena.alloc_ctor(3, 1, 24)) {
+            g_kernel_arena.track_child(l.raw());
+            lean_ctor_set(o, 0, l.raw());
+            lean_ctor_set_uint64(o, sizeof(void*)*1, data);
+            return expr(o);
+        }
+    }
+    object * o = lean_alloc_ctor(3, 1, 8);
+    lean_ctor_set(o, 0, l.to_obj_arg());
+    lean_ctor_set_uint64(o, sizeof(void*)*1, data);
+    return expr(o);
+}
 
 extern "C" object * lean_expr_mk_lambda(obj_arg n, obj_arg t, obj_arg e, uint8 bi);
 expr mk_lambda(name const & n, expr const & t, expr const & e, binder_info bi) {
-    return expr(lean_expr_mk_lambda(n.to_obj_arg(), t.to_obj_arg(), e.to_obj_arg(), static_cast<uint8>(bi)));
+    uint64_t data = mk_binding_data(get_data(t), get_data(e));
+    if (g_kernel_arena.m_active) {
+        if (object * o = g_kernel_arena.alloc_ctor(6, 3, 48)) {
+            g_kernel_arena.track_child(n.raw());
+            g_kernel_arena.track_child(t.raw());
+            g_kernel_arena.track_child(e.raw());
+            lean_ctor_set(o, 0, n.raw());
+            lean_ctor_set(o, 1, t.raw());
+            lean_ctor_set(o, 2, e.raw());
+            lean_ctor_set_uint64(o, sizeof(void*)*3, data);
+            lean_ctor_set_uint8(o, sizeof(void*)*3 + 8, static_cast<uint8>(bi));
+            return expr(o);
+        }
+    }
+    object * o = lean_alloc_ctor(6, 3, 9);
+    lean_ctor_set(o, 0, n.to_obj_arg());
+    lean_ctor_set(o, 1, t.to_obj_arg());
+    lean_ctor_set(o, 2, e.to_obj_arg());
+    lean_ctor_set_uint64(o, sizeof(void*)*3, data);
+    lean_ctor_set_uint8(o, sizeof(void*)*3 + 8, static_cast<uint8>(bi));
+    return expr(o);
 }
 
 extern "C" object * lean_expr_mk_forall(obj_arg n, obj_arg t, obj_arg e, uint8 bi);
 expr mk_pi(name const & n, expr const & t, expr const & e, binder_info bi) {
-    return expr(lean_expr_mk_forall(n.to_obj_arg(), t.to_obj_arg(), e.to_obj_arg(), static_cast<uint8>(bi)));
+    uint64_t data = mk_binding_data(get_data(t), get_data(e));
+    if (g_kernel_arena.m_active) {
+        if (object * o = g_kernel_arena.alloc_ctor(7, 3, 48)) {
+            g_kernel_arena.track_child(n.raw());
+            g_kernel_arena.track_child(t.raw());
+            g_kernel_arena.track_child(e.raw());
+            lean_ctor_set(o, 0, n.raw());
+            lean_ctor_set(o, 1, t.raw());
+            lean_ctor_set(o, 2, e.raw());
+            lean_ctor_set_uint64(o, sizeof(void*)*3, data);
+            lean_ctor_set_uint8(o, sizeof(void*)*3 + 8, static_cast<uint8>(bi));
+            return expr(o);
+        }
+    }
+    object * o = lean_alloc_ctor(7, 3, 9);
+    lean_ctor_set(o, 0, n.to_obj_arg());
+    lean_ctor_set(o, 1, t.to_obj_arg());
+    lean_ctor_set(o, 2, e.to_obj_arg());
+    lean_ctor_set_uint64(o, sizeof(void*)*3, data);
+    lean_ctor_set_uint8(o, sizeof(void*)*3 + 8, static_cast<uint8>(bi));
+    return expr(o);
 }
 
 static name * g_default_name = nullptr;
@@ -170,7 +562,30 @@ expr mk_arrow(expr const & t, expr const & e) {
 
 extern "C" object * lean_expr_mk_let(object * n, object * t, object * v, object * b, uint8 nondep);
 expr mk_let(name const & n, expr const & t, expr const & v, expr const & b, bool nondep) {
-    return expr(lean_expr_mk_let(n.to_obj_arg(), t.to_obj_arg(), v.to_obj_arg(), b.to_obj_arg(), nondep));
+    uint64_t data = mk_let_data(get_data(t), get_data(v), get_data(b));
+    if (g_kernel_arena.m_active) {
+        if (object * o = g_kernel_arena.alloc_ctor(8, 4, 56)) {
+            g_kernel_arena.track_child(n.raw());
+            g_kernel_arena.track_child(t.raw());
+            g_kernel_arena.track_child(v.raw());
+            g_kernel_arena.track_child(b.raw());
+            lean_ctor_set(o, 0, n.raw());
+            lean_ctor_set(o, 1, t.raw());
+            lean_ctor_set(o, 2, v.raw());
+            lean_ctor_set(o, 3, b.raw());
+            lean_ctor_set_uint64(o, sizeof(void*)*4, data);
+            lean_ctor_set_uint8(o, sizeof(void*)*4 + 8, static_cast<uint8>(nondep));
+            return expr(o);
+        }
+    }
+    object * o = lean_alloc_ctor(8, 4, 9);
+    lean_ctor_set(o, 0, n.to_obj_arg());
+    lean_ctor_set(o, 1, t.to_obj_arg());
+    lean_ctor_set(o, 2, v.to_obj_arg());
+    lean_ctor_set(o, 3, b.to_obj_arg());
+    lean_ctor_set_uint64(o, sizeof(void*)*4, data);
+    lean_ctor_set_uint8(o, sizeof(void*)*4 + 8, static_cast<uint8>(nondep));
+    return expr(o);
 }
 
 static expr * g_Prop  = nullptr;
@@ -368,23 +783,38 @@ extern "C" LEAN_EXPORT uint8 lean_expr_has_loose_bvar(b_obj_arg e, b_obj_arg i) 
     return has_loose_bvar(TO_REF(expr, e), lean_unbox(i));
 }
 
+struct lower_loose_bvars_policy {
+    static constexpr bool only_atomic = true;
+    unsigned m_s;
+    unsigned m_d;
+    bool should_return_self(expr const & e, unsigned offset) const {
+        unsigned s1 = m_s + offset;
+        return s1 < m_s || s1 >= get_loose_bvar_range(e);
+    }
+    expr visit_atomic(expr const & e, unsigned offset) const {
+        if (is_bvar(e)) {
+            nat const & vidx = bvar_idx(e);
+            unsigned s1 = m_s + offset;
+            if (vidx.is_small()) {
+                size_t idx = vidx.get_small_value();
+                if (idx >= s1) {
+                    lean_assert(idx >= offset + m_d);
+                    return mk_bvar(nat::of_size_t(idx - m_d));
+                }
+            } else if (vidx >= s1) {
+                return mk_bvar(vidx - nat(m_d));
+            }
+        }
+        return e;
+    }
+    optional<expr> visit(expr const &, unsigned) const { return none_expr(); }
+};
+
 expr lower_loose_bvars(expr const & e, unsigned s, unsigned d) {
     if (d == 0 || s >= get_loose_bvar_range(e))
         return e;
     lean_assert(s >= d);
-    return replace_cheap(e, [=](expr const & e, unsigned offset) -> optional<expr> {
-            unsigned s1 = s + offset;
-            if (s1 < s)
-                return some_expr(e); // overflow, vidx can't be >= max unsigned
-            if (s1 >= get_loose_bvar_range(e))
-                return some_expr(e); // expression e does not contain bound variables with idx >= s1
-            if (is_bvar(e) && bvar_idx(e) >= s1) {
-                lean_assert(bvar_idx(e) >= offset + d);
-                return some_expr(mk_bvar(bvar_idx(e) - nat(d)));
-            } else {
-                return none_expr();
-            }
-        });
+    return replace_custom(e, lower_loose_bvars_policy{s, d});
 }
 
 expr lower_loose_bvars(expr const & e, unsigned d) {
@@ -399,21 +829,36 @@ extern "C" LEAN_EXPORT object * lean_expr_lower_loose_bvars(b_obj_arg e, b_obj_a
     return lower_loose_bvars(TO_REF(expr, e), lean_unbox(s), lean_unbox(d)).steal();
 }
 
+struct lift_loose_bvars_policy {
+    static constexpr bool only_atomic = true;
+    unsigned m_s;
+    unsigned m_d;
+    bool should_return_self(expr const & e, unsigned offset) const {
+        unsigned s1 = m_s + offset;
+        return s1 < m_s || s1 >= get_loose_bvar_range(e);
+    }
+    expr visit_atomic(expr const & e, unsigned offset) const {
+        if (is_bvar(e)) {
+            nat const & vidx = bvar_idx(e);
+            unsigned s1 = m_s + offset;
+            if (vidx.is_small()) {
+                size_t idx = vidx.get_small_value();
+                if (idx >= s1) {
+                    return mk_bvar(nat::of_size_t(idx + m_d));
+                }
+            } else if (vidx >= s1) {
+                return mk_bvar(vidx + nat(m_d));
+            }
+        }
+        return e;
+    }
+    optional<expr> visit(expr const &, unsigned) const { return none_expr(); }
+};
+
 expr lift_loose_bvars(expr const & e, unsigned s, unsigned d) {
     if (d == 0 || s >= get_loose_bvar_range(e))
         return e;
-    return replace_cheap(e, [=](expr const & e, unsigned offset) -> optional<expr> {
-            unsigned s1 = s + offset;
-            if (s1 < s)
-                return some_expr(e); // overflow, vidx can't be >= max unsigned
-            if (s1 >= get_loose_bvar_range(e))
-                return some_expr(e); // expression e does not contain bound variables with idx >= s1
-            if (is_var(e) && bvar_idx(e) >= s + offset) {
-                return some_expr(mk_bvar(bvar_idx(e) + nat(d)));
-            } else {
-                return none_expr();
-            }
-        });
+    return replace_custom(e, lift_loose_bvars_policy{s, d});
 }
 
 expr lift_loose_bvars(expr const & e, unsigned d) {
@@ -457,6 +902,10 @@ expr infer_implicit(expr const & t, bool strict) {
 // Initialization & Finalization
 
 void initialize_expr() {
+    for (size_t i = 0; i < NUM_STATIC_BVARS; ++i) {
+        g_bvars[i] = lean_expr_mk_bvar(lean_box(i));
+        mark_persistent(g_bvars[i]);
+    }
     get_dummy();
     g_default_name = new name("a");
     mark_persistent(g_default_name->raw());

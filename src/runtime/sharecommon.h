@@ -19,21 +19,52 @@ It optimizes the number of RC operations, the strategy for caching results,
 and uses C++ hashmap.
 */
 class LEAN_EXPORT sharecommon_quick_fn {
-protected:
-    struct set_hash {
-        std::size_t operator()(lean_object * o) const { return lean_sharecommon_hash(o); }
+public:
+    struct flat_ptr_map {
+        struct slot {
+            lean_object * key;
+            lean_object * val;
+        };
+        slot *   m_slots;
+        size_t   m_cap;
+        size_t   m_sz;
+        uint32_t * m_used;
+        size_t   m_used_cap;
+
+        flat_ptr_map();
+        ~flat_ptr_map();
+        lean_object * find(lean_object * k) const;
+        void insert(lean_object * k, lean_object * v);
+        void grow();
     };
-    struct set_eq {
-        std::size_t operator()(lean_object * o1, lean_object * o2) const { return lean_sharecommon_eq(o1, o2); }
+
+    struct flat_obj_set {
+        struct slot {
+            lean_object * obj;
+            uint32_t      hash;
+        };
+        slot *   m_slots;
+        size_t   m_cap;
+        size_t   m_sz;
+        uint32_t * m_used;
+        size_t   m_used_cap;
+
+        flat_obj_set();
+        ~flat_obj_set();
+        lean_object * find_with_hash(lean_object * o, uint32_t h) const;
+        lean_object * find(lean_object * o) const;
+        void insert_with_hash(lean_object * o, uint32_t h);
+        void insert(lean_object * o);
+        void grow();
     };
 
     /*
     We use `m_cache` to ensure we do **not** traverse a DAG as a tree.
     We use pointer equality for this collection.
     */
-    lean::unordered_map<lean_object *, lean_object *> m_cache;
+    flat_ptr_map m_cache;
     /* Set of maximally shared terms. AKA hash-consing table. */
-    lean::unordered_set<lean_object *, set_hash, set_eq> m_set;
+    flat_obj_set m_set;
     /*
     If `true`, `check_cache` will also check `m_set`.
     This is useful when the input term may contain terms that have already

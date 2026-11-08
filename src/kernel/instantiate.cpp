@@ -12,28 +12,48 @@ Author: Leonardo de Moura
 #include "kernel/instantiate.h"
 
 namespace lean {
+
+struct instantiate_policy {
+    static constexpr bool only_atomic = true;
+    unsigned     m_s;
+    unsigned     m_n;
+    expr const * m_subst;
+    bool should_return_self(expr const & m, unsigned offset) const {
+        unsigned s1 = m_s + offset;
+        return s1 < m_s || s1 >= get_loose_bvar_range(m);
+    }
+    expr visit_atomic(expr const & m, unsigned offset) const {
+        if (is_bvar(m)) {
+            nat const & vidx = bvar_idx(m);
+            unsigned s1 = m_s + offset;
+            if (vidx.is_small()) {
+                size_t idx = vidx.get_small_value();
+                if (idx >= s1) {
+                    unsigned h = s1 + m_n;
+                    if (h < s1 || idx < h) {
+                        return lift_loose_bvars(m_subst[idx - s1], offset);
+                    } else {
+                        return mk_bvar(nat::of_size_t(idx - m_n));
+                    }
+                }
+            } else if (vidx >= s1) {
+                unsigned h = s1 + m_n;
+                if (h < s1 || vidx < h) {
+                    return lift_loose_bvars(m_subst[vidx.get_small_value() - s1], offset);
+                } else {
+                    return mk_bvar(vidx - nat(m_n));
+                }
+            }
+        }
+        return m;
+    }
+    optional<expr> visit(expr const &, unsigned) const { return none_expr(); }
+};
+
 expr instantiate(expr const & a, unsigned s, unsigned n, expr const * subst) {
     if (s >= get_loose_bvar_range(a) || n == 0)
         return a;
-    return replace_cheap(a, [=](expr const & m, unsigned offset) -> optional<expr> {
-            unsigned s1 = s + offset;
-            if (s1 < s)
-                return some_expr(m); // overflow, vidx can't be >= max unsigned
-            if (s1 >= get_loose_bvar_range(m))
-                return some_expr(m); // expression m does not contain loose bound variables with idx >= s1
-            if (is_bvar(m)) {
-                nat const & vidx = bvar_idx(m);
-                if (vidx >= s1) {
-                    unsigned h = s1 + n;
-                    if (h < s1 /* overflow, h is bigger than any vidx */ || vidx < h) {
-                        return some_expr(lift_loose_bvars(subst[vidx.get_small_value() - s1], offset));
-                    } else {
-                        return some_expr(mk_bvar(vidx - nat(n)));
-                    }
-                }
-            }
-            return none_expr();
-        });
+    return replace_custom(a, instantiate_policy{s, n, subst});
 }
 
 expr instantiate(expr const & e, unsigned n, expr const * s) { return instantiate(e, 0, n, s); }
@@ -51,29 +71,49 @@ extern "C" LEAN_EXPORT object * lean_expr_instantiate1(object * a0, object * e0)
     return r.steal();
 }
 
+struct instantiate_raw_policy {
+    static constexpr bool only_atomic = true;
+    size_t    m_n;
+    object ** m_subst;
+    bool should_return_self(expr const & m, unsigned offset) const {
+        return offset >= get_loose_bvar_range(m);
+    }
+    expr visit_atomic(expr const & m, unsigned offset) const {
+        if (is_bvar(m)) {
+            nat const & vidx = bvar_idx(m);
+            if (vidx.is_small()) {
+                size_t idx = vidx.get_small_value();
+                if (idx >= offset) {
+                    size_t h = offset + m_n;
+                    if (h < offset || idx < h) {
+                        object * v = m_subst[idx - offset];
+                        return lift_loose_bvars(TO_REF(expr, v), offset);
+                    } else {
+                        return mk_bvar(nat::of_size_t(idx - m_n));
+                    }
+                }
+            } else if (vidx >= offset) {
+                size_t h = offset + m_n;
+                if (h < offset) {
+                    object * v = m_subst[vidx.get_small_value() - offset];
+                    return lift_loose_bvars(TO_REF(expr, v), offset);
+                } else {
+                    return mk_bvar(vidx - nat::of_size_t(m_n));
+                }
+            }
+        }
+        return m;
+    }
+    optional<expr> visit(expr const &, unsigned) const { return none_expr(); }
+};
+
 static object * lean_expr_instantiate_core(b_obj_arg a0, size_t n, object** subst) {
     expr const & a = reinterpret_cast<expr const &>(a0);
     if (!has_loose_bvars(a) || n == 0) {
         lean_inc(a0);
         return a0;
     }
-    expr r = replace_cheap(a, [=](expr const & m, unsigned offset) -> optional<expr> {
-            if (offset >= get_loose_bvar_range(m))
-                return some_expr(m); // expression m does not contain loose bound variables with idx >= offset
-            if (is_bvar(m)) {
-                nat const & vidx = bvar_idx(m);
-                if (vidx >= offset) {
-                    size_t h = offset + n;
-                    if (h < offset /* overflow, h is bigger than any vidx */ || (vidx.is_small() && vidx.get_small_value() < h)) {
-                        object * v = subst[vidx.get_small_value() - offset];
-                        return some_expr(lift_loose_bvars(TO_REF(expr, v), offset));
-                    } else {
-                        return some_expr(mk_bvar(vidx - nat::of_size_t(n)));
-                    }
-                }
-            }
-            return none_expr();
-        });
+    expr r = replace_custom(a, instantiate_raw_policy{n, subst});
     return r.steal();
 }
 
@@ -95,50 +135,89 @@ extern "C" LEAN_EXPORT object * lean_expr_instantiate_range(b_obj_arg a, b_obj_a
     }
 }
 
-expr instantiate_rev(expr const & a, unsigned n, expr const * subst) {
-    if (!has_loose_bvars(a))
-        return a;
-    return replace_cheap(a, [=](expr const & m, unsigned offset) -> optional<expr> {
-            if (offset >= get_loose_bvar_range(m))
-                return some_expr(m); // expression m does not contain loose bound variables with idx >= offset
-            if (is_bvar(m)) {
-                nat const & vidx = bvar_idx(m);
-                if (vidx >= offset) {
-                    size_t h = offset + n;
-                    if (h < offset /* overflow, h is bigger than any vidx */ || (vidx.is_small() && vidx.get_small_value() < h)) {
-                        return some_expr(lift_loose_bvars(subst[n - (vidx.get_small_value() - offset) - 1], offset));
+struct instantiate_rev_policy {
+    static constexpr bool only_atomic = true;
+    unsigned     m_n;
+    expr const * m_subst;
+    bool should_return_self(expr const & m, unsigned offset) const {
+        return offset >= get_loose_bvar_range(m);
+    }
+    expr visit_atomic(expr const & m, unsigned offset) const {
+        if (is_bvar(m)) {
+            nat const & vidx = bvar_idx(m);
+            if (vidx.is_small()) {
+                size_t idx = vidx.get_small_value();
+                if (idx >= offset) {
+                    size_t h = offset + m_n;
+                    if (h < offset || idx < h) {
+                        return lift_loose_bvars(m_subst[m_n - (idx - offset) - 1], offset);
                     } else {
-                        return some_expr(mk_bvar(vidx - nat(n)));
+                        return mk_bvar(nat::of_size_t(idx - m_n));
                     }
                 }
+            } else if (vidx >= offset) {
+                size_t h = offset + m_n;
+                if (h < offset) {
+                    return lift_loose_bvars(m_subst[m_n - (vidx.get_small_value() - offset) - 1], offset);
+                } else {
+                    return mk_bvar(vidx - nat(m_n));
+                }
             }
-            return none_expr();
-        });
+        }
+        return m;
+    }
+    optional<expr> visit(expr const &, unsigned) const { return none_expr(); }
+};
+
+expr instantiate_rev(expr const & a, unsigned n, expr const * subst) {
+    if (!has_loose_bvars(a) || n == 0)
+        return a;
+    return replace_custom(a, instantiate_rev_policy{n, subst});
 }
+
+struct instantiate_rev_raw_policy {
+    static constexpr bool only_atomic = true;
+    size_t    m_n;
+    object ** m_subst;
+    bool should_return_self(expr const & m, unsigned offset) const {
+        return offset >= get_loose_bvar_range(m);
+    }
+    expr visit_atomic(expr const & m, unsigned offset) const {
+        if (is_bvar(m)) {
+            nat const & vidx = bvar_idx(m);
+            if (vidx.is_small()) {
+                size_t idx = vidx.get_small_value();
+                if (idx >= offset) {
+                    size_t h = offset + m_n;
+                    if (h < offset || idx < h) {
+                        object * v = m_subst[m_n - (idx - offset) - 1];
+                        return lift_loose_bvars(TO_REF(expr, v), offset);
+                    } else {
+                        return mk_bvar(nat::of_size_t(idx - m_n));
+                    }
+                }
+            } else if (vidx >= offset) {
+                size_t h = offset + m_n;
+                if (h < offset) {
+                    object * v = m_subst[m_n - (vidx.get_small_value() - offset) - 1];
+                    return lift_loose_bvars(TO_REF(expr, v), offset);
+                } else {
+                    return mk_bvar(vidx - nat::of_size_t(m_n));
+                }
+            }
+        }
+        return m;
+    }
+    optional<expr> visit(expr const &, unsigned) const { return none_expr(); }
+};
 
 static object * lean_expr_instantiate_rev_core(object * a0, size_t n, object ** subst) {
     expr const & a = reinterpret_cast<expr const &>(a0);
-    if (!has_loose_bvars(a)) {
+    if (!has_loose_bvars(a) || n == 0) {
         lean_inc(a0);
         return a0;
     }
-    expr r = replace_cheap(a, [=](expr const & m, unsigned offset) -> optional<expr> {
-            if (offset >= get_loose_bvar_range(m))
-                return some_expr(m); // expression m does not contain loose bound variables with idx >= offset
-            if (is_bvar(m)) {
-                nat const & vidx = bvar_idx(m);
-                if (vidx >= offset) {
-                    size_t h = offset + n;
-                    if (h < offset /* overflow, h is bigger than any vidx */ || (vidx.is_small() && vidx.get_small_value() < h)) {
-                        object * v = subst[n - (vidx.get_small_value() - offset) - 1];
-                        return some_expr(lift_loose_bvars(TO_REF(expr, v), offset));
-                    } else {
-                        return some_expr(mk_bvar(vidx - nat::of_size_t(n)));
-                    }
-                }
-            }
-            return none_expr();
-        });
+    expr r = replace_custom(a, instantiate_rev_raw_policy{n, subst});
     return r.steal();
 }
 
@@ -213,20 +292,113 @@ expr cheap_beta_reduce(expr const & e) {
     }
 }
 
+struct instantiate_lparams_policy {
+    static constexpr bool only_atomic = false;
+    names const &  m_lps;
+    levels const & m_ls;
+    bool should_return_self(expr const & e, unsigned) const {
+        return !has_param_univ(e);
+    }
+    expr visit_atomic(expr const & e, unsigned) const { return e; }
+    optional<expr> visit(expr const & e, unsigned) const {
+        if (is_constant(e)) {
+            return some_expr(update_constant(e, map_reuse(const_levels(e), [&](level const & l) { return instantiate(l, m_lps, m_ls); })));
+        } else if (is_sort(e)) {
+            return some_expr(update_sort(e, instantiate(sort_level(e), m_lps, m_ls)));
+        } else {
+            return none_expr();
+        }
+    }
+};
+
+struct lparams_cache {
+    static constexpr size_t CAPACITY = 16384;
+    static constexpr size_t MASK = CAPACITY - 1;
+    struct slot {
+        lean_object * m_expr = nullptr;
+        lean_object * m_lps  = nullptr;
+        lean_object * m_ls   = nullptr;
+        lean_object * m_res  = nullptr;
+        ~slot() {
+            if (m_expr) lean_dec(m_expr);
+            if (m_lps)  lean_dec(m_lps);
+            if (m_ls)   lean_dec(m_ls);
+            if (m_res)  lean_dec(m_res);
+        }
+    };
+    slot m_slots[CAPACITY];
+
+    static unsigned hash_levels(levels const & ls) {
+        unsigned h = 23;
+        levels const * it = &ls;
+        while (!is_nil(*it)) {
+            h = hash(h, head(*it).hash());
+            it = &tail(*it);
+        }
+        return h;
+    }
+
+    static bool eq_levels(lean_object * a_raw, levels const & b) {
+        if (a_raw == b.raw()) return true;
+        levels const & a = TO_REF(levels, a_raw);
+        levels const * it1 = &a;
+        levels const * it2 = &b;
+        while (!is_nil(*it1) && !is_nil(*it2)) {
+            if (!is_eqp(head(*it1), head(*it2)) && head(*it1) != head(*it2))
+                return false;
+            it1 = &tail(*it1);
+            it2 = &tail(*it2);
+        }
+        return is_nil(*it1) && is_nil(*it2);
+    }
+
+    lean_object * find(expr const & e, names const & lps, levels const & ls, unsigned h) const {
+        size_t idx = h & MASK;
+        for (unsigned i = 0; i < 2; ++i) {
+            slot const & s = m_slots[(idx + i) & MASK];
+            if (s.m_expr == e.raw() && s.m_lps == lps.raw() && eq_levels(s.m_ls, ls)) {
+                return s.m_res;
+            }
+        }
+        return nullptr;
+    }
+
+    void insert(expr const & e, names const & lps, levels const & ls, expr const & res, unsigned h) {
+        size_t idx = h & MASK;
+        size_t target = (m_slots[idx].m_expr == nullptr) ? idx : ((idx + 1) & MASK);
+        slot & s = m_slots[target];
+        lean_inc(e.raw());
+        lean_inc(lps.raw());
+        lean_inc(ls.raw());
+        lean_inc(res.raw());
+        if (s.m_expr) lean_dec(s.m_expr);
+        if (s.m_lps)  lean_dec(s.m_lps);
+        if (s.m_ls)   lean_dec(s.m_ls);
+        if (s.m_res)  lean_dec(s.m_res);
+        s.m_expr = e.raw();
+        s.m_lps  = lps.raw();
+        s.m_ls   = ls.raw();
+        s.m_res  = res.raw();
+    }
+};
+
+static thread_local lparams_cache g_lparams_cache;
+
 expr instantiate_lparams(expr const & e, names const & lps, levels const & ls) {
     if (!has_param_univ(e))
         return e;
-    return replace(e, [&](expr const & e) -> optional<expr> {
-            if (!has_param_univ(e))
-                return some_expr(e);
-            if (is_constant(e)) {
-                return some_expr(update_constant(e, map_reuse(const_levels(e), [&](level const & l) { return instantiate(l, lps, ls); })));
-            } else if (is_sort(e)) {
-                return some_expr(update_sort(e, instantiate(sort_level(e), lps, ls)));
-            } else {
-                return none_expr();
-            }
-        });
+    return replace_custom(e, instantiate_lparams_policy{lps, ls});
+}
+
+static expr instantiate_lparams_cached(expr const & e, names const & lps, levels const & ls) {
+    unsigned h = hash(static_cast<unsigned>((uintptr_t)e.raw() >> 3), lparams_cache::hash_levels(ls));
+    if (lean_object * cached = g_lparams_cache.find(e, lps, ls, h)) {
+        return expr(cached, true);
+    }
+    kernel_arena_pause_scope pause;
+    expr res = replace_custom(e, instantiate_lparams_policy{lps, ls});
+    g_lparams_cache.insert(e, lps, ls, res, h);
+    return res;
 }
 
 expr instantiate_type_lparams(constant_info const & info, levels const & ls) {
@@ -234,7 +406,7 @@ expr instantiate_type_lparams(constant_info const & info, levels const & ls) {
         lean_internal_panic("#universes mismatch at instantiateTypeLevelParams");
     if (is_nil(ls) || !has_param_univ(info.get_type()))
         return info.get_type();
-    return instantiate_lparams(info.get_type(), info.get_lparams(), ls);
+    return instantiate_lparams_cached(info.get_type(), info.get_lparams(), ls);
 }
 
 expr instantiate_value_lparams(constant_info const & info, levels const & ls) {
@@ -244,7 +416,7 @@ expr instantiate_value_lparams(constant_info const & info, levels const & ls) {
         lean_internal_panic("definition/theorem expected at instantiateValueLevelParams");
     if (is_nil(ls) || !has_param_univ(info.get_value()))
         return info.get_value();
-    return instantiate_lparams(info.get_value(), info.get_lparams(), ls);
+    return instantiate_lparams_cached(info.get_value(), info.get_lparams(), ls);
 }
 
 }

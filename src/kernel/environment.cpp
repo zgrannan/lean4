@@ -123,15 +123,20 @@ void environment::check_duplicated_univ_params(names ls) const {
     ::lean::check_duplicated_univ_params(*this, ls);
 }
 
-static void check_constant_val(environment const & env, constant_val const & v, type_checker & checker) {
+static void check_constant_val(environment const & env, constant_val const & v, expr const & type, type_checker & checker) {
     check_name(env, v.get_name());
     check_duplicated_univ_params(env, v.get_lparams());
-    check_no_metavar_no_fvar(env, v.get_name(), v.get_type());
-    expr sort = checker.check(v.get_type(), v.get_lparams());
-    checker.ensure_sort(sort, v.get_type());
+    check_no_metavar_no_fvar(env, v.get_name(), type);
+    expr sort = checker.check(type, v.get_lparams());
+    checker.ensure_sort(sort, type);
+}
+
+static void check_constant_val(environment const & env, constant_val const & v, type_checker & checker) {
+    check_constant_val(env, v, v.get_type(), checker);
 }
 
 static void check_constant_val(environment const & env, constant_val const & v, diagnostics * diag, definition_safety ds) {
+    kernel_arena_scope arena;
     type_checker checker(env, diag, ds);
     check_constant_val(env, v, checker);
 }
@@ -163,11 +168,13 @@ environment environment::add_definition(declaration const & d, bool check) const
         /* Meta definition can be recursive.
            So, we check the header, add, and then type check the body. */
         if (check) {
+            kernel_arena_scope arena;
             type_checker checker(*this, diag.get(), definition_safety::unsafe);
             check_constant_val(*this, v.to_constant_val(), checker);
         }
         environment new_env = add(constant_info(d));
         if (check) {
+            kernel_arena_scope arena;
             type_checker checker(new_env, diag.get(), definition_safety::unsafe);
             check_no_metavar_no_fvar(new_env, v.get_name(), v.get_value());
             expr val_type = checker.check(v.get_value(), v.get_lparams());
@@ -177,6 +184,7 @@ environment environment::add_definition(declaration const & d, bool check) const
         return diag.update(new_env);
     } else {
         if (check) {
+            kernel_arena_scope arena;
             type_checker checker(*this, diag.get());
             check_constant_val(*this, v.to_constant_val(), checker);
             check_no_metavar_no_fvar(*this, v.get_name(), v.get_value());
@@ -192,11 +200,12 @@ environment environment::add_theorem(declaration const & d, bool check) const {
     scoped_diagnostics diag(*this, check);
     theorem_val const & v = d.to_theorem_val();
     if (check) {
-        type_checker checker(*this, diag.get());
         sharecommon_persistent_fn share;
         expr val(share(v.get_value().raw()));
         expr type(share(v.get_type().raw()));
-        check_constant_val(*this, v.to_constant_val(), checker);
+        kernel_arena_scope arena;
+        type_checker checker(*this, diag.get());
+        check_constant_val(*this, v.to_constant_val(), type, checker);
         if (!checker.is_prop(type))
             throw theorem_type_is_not_prop(*this, v.get_name(), type);
         check_no_metavar_no_fvar(*this, v.get_name(), val);
@@ -211,6 +220,7 @@ environment environment::add_opaque(declaration const & d, bool check) const {
     scoped_diagnostics diag(*this, check);
     opaque_val const & v = d.to_opaque_val();
     if (check) {
+        kernel_arena_scope arena;
         type_checker checker(*this, diag.get());
         check_constant_val(*this, v.to_constant_val(), checker);
         check_no_metavar_no_fvar(*this, v.get_name(), v.get_value());
@@ -232,6 +242,7 @@ environment environment::add_mutual(declaration const & d, bool check) const {
     names const & lparams = head(vs).get_lparams();
     /* Check declarations header */
     if (check) {
+        kernel_arena_scope arena;
         type_checker checker(*this, diag.get(), safety);
         name_set found;
         for (definition_val const & v : vs) {
@@ -256,6 +267,7 @@ environment environment::add_mutual(declaration const & d, bool check) const {
     }
     /* Check actual definitions */
     if (check) {
+        kernel_arena_scope arena;
         type_checker checker(new_env, diag.get(), safety);
         for (definition_val const & v : vs) {
             check_no_metavar_no_fvar(new_env, v.get_name(), v.get_value());

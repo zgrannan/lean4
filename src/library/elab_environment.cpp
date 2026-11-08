@@ -48,6 +48,7 @@ environment elab_environment::to_kernel_env() const {
 extern "C" LEAN_EXPORT lean_object * lean_kernel_is_def_eq(lean_object * obj_env, lean_object * lctx, lean_object * a, lean_object * b) {
     elab_environment env(obj_env);
     return catch_kernel_exceptions<object*>([&]() {
+        kernel_arena_scope arena;
         return lean_box(type_checker(env.to_kernel_env(), local_ctx(lctx)).is_def_eq(expr(a), expr(b)));
     });
 }

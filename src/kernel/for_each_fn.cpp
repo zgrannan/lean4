@@ -5,6 +5,7 @@ Released under Apache 2.0 license as described in the file LICENSE.
 Author: Leonardo de Moura
 */
 #include <vector>
+#include <cstring>
 #include <unordered_map>
 #include <utility>
 #include "runtime/memory.h"
@@ -14,19 +15,72 @@ Author: Leonardo de Moura
 
 namespace lean {
 
+struct for_each_cache {
+    static constexpr size_t CAPACITY = 16384;
+    static constexpr size_t MASK = CAPACITY - 1;
+    struct slot {
+        lean_object * key;
+        uint32_t      offset;
+        uint32_t      epoch;
+    };
+    slot     m_slots[CAPACITY];
+    uint32_t m_epoch = 1;
+    uint32_t m_depth = 0;
+
+    for_each_cache() {
+        std::memset(m_slots, 0, sizeof(m_slots));
+    }
+
+    uint32_t enter() {
+        if (m_depth == 0 && m_epoch > 0xFFFF0000u) {
+            std::memset(m_slots, 0, sizeof(m_slots));
+            m_epoch = 1;
+        }
+        ++m_depth;
+        return ++m_epoch;
+    }
+
+    void leave() {
+        --m_depth;
+    }
+
+    bool check_and_insert(lean_object * key, uint32_t offset, uint32_t my_epoch) {
+        size_t idx = static_cast<size_t>(hash(static_cast<unsigned>((uintptr_t)key >> 3), offset)) & MASK;
+        unsigned insert_pos = 3;
+        for (unsigned i = 0; i < 4; ++i) {
+            slot const & s = m_slots[(idx + i) & MASK];
+            if (s.epoch == my_epoch) {
+                if (s.key == key && s.offset == offset)
+                    return true;
+            } else {
+                if (insert_pos == 3)
+                    insert_pos = i;
+                if (s.epoch < my_epoch)
+                    break;
+            }
+        }
+        slot & dst = m_slots[(idx + insert_pos) & MASK];
+        dst.key    = key;
+        dst.offset = offset;
+        dst.epoch  = my_epoch;
+        return false;
+    }
+};
+
+static thread_local for_each_cache g_for_each_cache;
+
 /*
 If `partial_apps = true`, then given a term `g a b`, we also apply the function `m_f` to `g a`,
 and not only to `g`, `a`, and `b`.
 */
 template<bool partial_apps> class for_each_fn {
-    lean::unordered_set<lean_object *> m_cache;
+    uint32_t m_epoch = 0;
     std::function<bool(expr const &)> m_f; // NOLINT
 
     bool visited(expr const & e) {
         if (is_likely_unshared(e)) return false;
-        if (m_cache.find(e.raw()) != m_cache.end()) return true;
-        m_cache.insert(e.raw());
-        return false;
+        if (m_epoch == 0) m_epoch = g_for_each_cache.enter();
+        return g_for_each_cache.check_and_insert(e.raw(), 0, m_epoch);
     }
 
     void apply_fn(expr const & e) {
@@ -86,23 +140,20 @@ template<bool partial_apps> class for_each_fn {
 public:
     for_each_fn(std::function<bool(expr const &)> && f):m_f(f) {}        // NOLINT
     for_each_fn(std::function<bool(expr const &)> const & f):m_f(f) {}   // NOLINT
+    ~for_each_fn() {
+        if (m_epoch != 0) g_for_each_cache.leave();
+    }
     void operator()(expr const & e) { apply(e); }
 };
 
 class for_each_offset_fn {
-    struct key_hasher {
-        std::size_t operator()(std::pair<lean_object *, unsigned> const & p) const {
-            return hash((size_t)p.first, p.second);
-        }
-    };
-    lean::unordered_set<std::pair<lean_object *, unsigned>, key_hasher> m_cache;
+    uint32_t m_epoch = 0;
     std::function<bool(expr const &, unsigned)> m_f; // NOLINT
 
     bool visited(expr const & e, unsigned offset) {
         if (is_likely_unshared(e)) return false;
-        if (m_cache.find(std::make_pair(e.raw(), offset)) != m_cache.end()) return true;
-        m_cache.insert(std::make_pair(e.raw(), offset));
-        return false;
+        if (m_epoch == 0) m_epoch = g_for_each_cache.enter();
+        return g_for_each_cache.check_and_insert(e.raw(), offset, m_epoch);
     }
 
     void apply(expr const & e, unsigned offset) {
@@ -150,6 +201,9 @@ class for_each_offset_fn {
 public:
     for_each_offset_fn(std::function<bool(expr const &, unsigned)> && f):m_f(f) {}        // NOLINT
     for_each_offset_fn(std::function<bool(expr const &, unsigned)> const & f):m_f(f) {}   // NOLINT
+    ~for_each_offset_fn() {
+        if (m_epoch != 0) g_for_each_cache.leave();
+    }
     void operator()(expr const & e) { apply(e, 0); }
 };
 

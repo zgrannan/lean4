@@ -15,9 +15,9 @@ class kernel_exception : public exception {
 protected:
     environment m_env;
 public:
-    kernel_exception(environment const & env):exception("kernel exception"), m_env(env) {}
-    kernel_exception(environment const & env, char const * msg):exception(msg), m_env(env) {}
-    kernel_exception(environment const & env, sstream const & strm):exception(strm), m_env(env) {}
+    kernel_exception(environment const & env):exception("kernel exception"), m_env(env) { kernel_arena_retain_on_exception(); }
+    kernel_exception(environment const & env, char const * msg):exception(msg), m_env(env) { kernel_arena_retain_on_exception(); }
+    kernel_exception(environment const & env, sstream const & strm):exception(strm), m_env(env) { kernel_arena_retain_on_exception(); }
     environment const & get_environment() const { return m_env; }
     environment const & env() const { return m_env; }
 };
@@ -41,7 +41,7 @@ class definition_type_mismatch_exception : public kernel_exception {
     expr m_given_type;
 public:
     definition_type_mismatch_exception(environment const & env, declaration const & decl, expr const & given_type):
-        kernel_exception(env), m_decl(decl), m_given_type(given_type) {}
+        kernel_exception(env), m_decl(decl), m_given_type(kernel_arena_promote(given_type)) {}
     declaration const & get_declaration() const { return m_decl; }
     expr const & get_given_type() const { return m_given_type; }
 };
@@ -51,7 +51,7 @@ class declaration_has_metavars_exception : public kernel_exception {
     expr m_expr;
 public:
     declaration_has_metavars_exception(environment const & env, name const & n, expr const & e):
-        kernel_exception(env), m_name(n), m_expr(e) {}
+        kernel_exception(env), m_name(n), m_expr(kernel_arena_promote(e)) {}
     name const & get_decl_name() const { return m_name; }
     expr const & get_expr() const { return m_expr; }
 };
@@ -61,7 +61,7 @@ class declaration_has_free_vars_exception : public kernel_exception {
     expr m_expr;
 public:
     declaration_has_free_vars_exception(environment const & env, name const & n, expr const & e):
-        kernel_exception(env), m_name(n), m_expr(e) {}
+        kernel_exception(env), m_name(n), m_expr(kernel_arena_promote(e)) {}
     name const & get_decl_name() const { return m_name; }
     expr const & get_expr() const { return m_expr; }
 };
@@ -71,7 +71,7 @@ class theorem_type_is_not_prop : public kernel_exception {
     expr m_type;
 public:
     theorem_type_is_not_prop(environment const & env, name const & n, expr const & type):
-        kernel_exception(env), m_name(n), m_type(type) {}
+        kernel_exception(env), m_name(n), m_type(kernel_arena_promote(type)) {}
     name const & get_decl_name() const { return m_name; }
     expr const & get_type() const { return m_type; }
 };
@@ -88,7 +88,7 @@ class function_expected_exception : public kernel_exception_with_lctx {
     expr m_fn;
 public:
     function_expected_exception(environment const & env, local_ctx const & lctx, expr const & fn):
-        kernel_exception_with_lctx(env, lctx), m_fn(fn) {}
+        kernel_exception_with_lctx(env, lctx), m_fn(kernel_arena_promote(fn)) {}
     expr const & get_fn() const { return m_fn; }
 };
 
@@ -96,7 +96,7 @@ class type_expected_exception : public kernel_exception_with_lctx {
     expr m_type;
 public:
     type_expected_exception(environment const & env, local_ctx const & lctx, expr const & type):
-        kernel_exception_with_lctx(env, lctx), m_type(type) {}
+        kernel_exception_with_lctx(env, lctx), m_type(kernel_arena_promote(type)) {}
     expr const & get_type() const { return m_type; }
 };
 
@@ -105,7 +105,7 @@ class type_mismatch_exception : public kernel_exception_with_lctx {
     expr m_expected_type;
 public:
     type_mismatch_exception(environment const & env, local_ctx const & lctx, expr const & given_type, expr const & expected_type):
-        kernel_exception_with_lctx(env, lctx), m_given_type(given_type), m_expected_type(expected_type) {}
+        kernel_exception_with_lctx(env, lctx), m_given_type(kernel_arena_promote(given_type)), m_expected_type(kernel_arena_promote(expected_type)) {}
     expr const & get_given_type() const { return m_given_type; }
     expr const & get_expected_type() const { return m_expected_type; }
 };
@@ -123,7 +123,7 @@ class expr_type_mismatch_exception : public kernel_exception_with_lctx {
     expr m_expected_type;
 public:
     expr_type_mismatch_exception(environment const & env, local_ctx const & lctx, expr const & e, expr const & expected_type):
-        kernel_exception_with_lctx(env, lctx), m_expr(e), m_expected_type(expected_type) {}
+        kernel_exception_with_lctx(env, lctx), m_expr(kernel_arena_promote(e)), m_expected_type(kernel_arena_promote(expected_type)) {}
     expr const & get_expr() const { return m_expr; }
     expr const & get_expected_type() const { return m_expected_type; }
 };
@@ -135,7 +135,7 @@ class app_type_mismatch_exception : public kernel_exception_with_lctx {
 public:
     app_type_mismatch_exception(environment const & env, local_ctx const & lctx, expr const & app,
             expr const & function_type, expr const & arg_type):
-        kernel_exception_with_lctx(env, lctx), m_app(app), m_function_type(function_type), m_arg_type(arg_type) {}
+        kernel_exception_with_lctx(env, lctx), m_app(kernel_arena_promote(app)), m_function_type(kernel_arena_promote(function_type)), m_arg_type(kernel_arena_promote(arg_type)) {}
     expr const & get_app() const { return m_app; }
     expr const & get_function_type() const { return m_function_type; }
     expr const & get_arg_type() const { return m_arg_type; }
@@ -145,7 +145,7 @@ class invalid_proj_exception : public kernel_exception_with_lctx {
     expr m_proj;
 public:
     invalid_proj_exception(environment const & env, local_ctx const & lctx, expr const & proj):
-        kernel_exception_with_lctx(env, lctx), m_proj(proj) {}
+        kernel_exception_with_lctx(env, lctx), m_proj(kernel_arena_promote(proj)) {}
     expr const & get_proj() const { return m_proj; }
 };
 
