@@ -1206,44 +1206,52 @@ namespace CheckAssignmentQuick
 unsafe def checkImpl
     (hasCtxLocals : Bool)
     (mctx : MetavarContext) (lctx : LocalContext) (mvarDecl : MetavarDecl) (mvarId : MVarId) (fvars : Array Expr) (e : Expr) : Bool :=
+  let checkFVar (fvarId : FVarId) : Bool :=
+    if mvarDecl.lctx.contains fvarId then
+      true
+    else if let some (LocalDecl.ldecl (nondep := false) ..) := lctx.find? fvarId then
+      false -- need expensive CheckAssignment.check
+    else if fvars.any fun x => x.fvarId! == fvarId then
+      true
+    else
+      false -- We could throw an exception here, but we would have to use ExceptM. So, we let CheckAssignment.check do it
+  let checkMVar (mvarId' : MVarId) : Bool :=
+    match mctx.getExprAssignmentCore? mvarId' with
+    | some _ => false -- use CheckAssignment.check to instantiate
+    | none =>
+      if mvarId' == mvarId then false -- occurs check failed, use CheckAssignment.check to throw exception
+      else match mctx.findDecl? mvarId' with
+        | none => false
+        | some mvarDecl' =>
+          if hasCtxLocals then false -- use CheckAssignment.check
+          else if !mvarDecl'.lctx.isSubPrefixOf mvarDecl.lctx fvars then false -- use CheckAssignment.check
+          else (mctx.getDelayedMVarAssignmentCore? mvarId').isNone -- use CheckAssignment.check if delayed assigned
   let rec visit (e : Expr) : StateM (PtrSet Expr) Bool := do
     if !e.hasExprMVar && !e.hasFVar then
       return true
-    if (← get).contains e then
-      return true
-    modify fun visited => visited.insert e
     match e with
-    | .mdata _ b       => visit b
-    | .proj _ _ s      => visit s
-    | .app f a         => visit f <&&> visit a
-    | .lam _ d b _     => visit d <&&> visit b
-    | .forallE _ d b _ => visit d <&&> visit b
-    | .letE _ t v b _  => visit t <&&> visit v <&&> visit b
-    | .bvar .. | .sort .. | .const ..
-    | .lit .. => return true
-    | .fvar fvarId ..  =>
-      if mvarDecl.lctx.contains fvarId then
-        return true
-      /-
-      Recall: if `nondep := true` then the ldecl is locally a cdecl. See comment in `CheckAssignment.checkFVar`.
-      -/
-      if let some (LocalDecl.ldecl (nondep := false) ..) := lctx.find? fvarId then
-        return false -- need expensive CheckAssignment.check
-      if fvars.any fun x => x.fvarId! == fvarId then
-        return true
-      return false -- We could throw an exception here, but we would have to use ExceptM. So, we let CheckAssignment.check do it
-    | .mvar mvarId'    =>
-      let none := mctx.getExprAssignmentCore? mvarId' | return false -- use CheckAssignment.check to instantiate
-      if mvarId' == mvarId then return false -- occurs check failed, use CheckAssignment.check to throw exception
-      let some mvarDecl' := mctx.findDecl? mvarId' | return false
-      if hasCtxLocals then return false -- use CheckAssignment.check
-      if !mvarDecl'.lctx.isSubPrefixOf mvarDecl.lctx fvars then return false -- use CheckAssignment.check
-      let none := mctx.getDelayedMVarAssignmentCore? mvarId' | return false -- use CheckAssignment.check
-      return true
+    | .fvar fvarId ..  => return checkFVar fvarId
+    | .mvar mvarId'    => return checkMVar mvarId'
+    | .bvar .. | .sort .. | .const .. | .lit .. => return true
+    | _ =>
+      if !isExclusiveUnsafe e then
+        if (← get).contains e then
+          return true
+        modify fun visited => visited.insert e
+      match e with
+      | .mdata _ b       => visit b
+      | .proj _ _ s      => visit s
+      | .app f a         => visit f <&&> visit a
+      | .lam _ d b _     => visit d <&&> visit b
+      | .forallE _ d b _ => visit d <&&> visit b
+      | .letE _ t v b _  => visit t <&&> visit v <&&> visit b
+      | _                => return true
   if !e.hasExprMVar && !e.hasFVar then
     true
-  else
-    visit e |>.run' mkPtrSet
+  else match e with
+    | .fvar fvarId .. => checkFVar fvarId
+    | .mvar mvarId'   => checkMVar mvarId'
+    | _               => visit e |>.run' mkPtrSet
 
 def check (hasCtxLocals : Bool) (mctx : MetavarContext) (lctx : LocalContext) (mvarDecl : MetavarDecl) (mvarId : MVarId) (fvars : Array Expr) (e : Expr) : Bool :=
   unsafe checkImpl hasCtxLocals mctx lctx mvarDecl mvarId fvars e
@@ -1253,12 +1261,16 @@ end CheckAssignmentQuick
 /-- `typeOccursCheck` implementation using unsafe (i.e., pointer equality) features. -/
 private unsafe def typeOccursCheckImp (mctx : MetavarContext) (mvarId : MVarId) (v : Expr) : Bool :=
   if v.hasExprMVar then
-    visit v |>.run' mkPtrSet
+    match v with
+    | .mvar mvarId' => visitMVar mvarId'
+    | _ => visit v |>.run' mkPtrSet
   else
     true
 where
   alreadyVisited (e : Expr) : StateM (PtrSet Expr) Bool := do
-    if (← get).contains e then
+    if isExclusiveUnsafe e then
+      return false
+    else if (← get).contains e then
       return true
     else
       modify fun s => s.insert e
@@ -1278,18 +1290,21 @@ where
   visit (e : Expr) : StateM (PtrSet Expr) Bool := do
     if !e.hasExprMVar then
       return true
-    else if (← alreadyVisited e) then
-      return true
     else match e with
-      | .mdata _ b       => visit b
-      | .proj _ _ s      => visit s
-      | .app f a         => visit f <&&> visit a
-      | .lam _ d b _     => visit d <&&> visit b
-      | .forallE _ d b _ => visit d <&&> visit b
-      | .letE _ t v b _  => visit t <&&> visit v <&&> visit b
       | .mvar mvarId'    => return visitMVar mvarId'
       | .bvar .. | .sort .. | .const .. | .fvar ..
       | .lit .. => return true
+      | _ =>
+        if (← alreadyVisited e) then
+          return true
+        else match e with
+          | .mdata _ b       => visit b
+          | .proj _ _ s      => visit s
+          | .app f a         => visit f <&&> visit a
+          | .lam _ d b _     => visit d <&&> visit b
+          | .forallE _ d b _ => visit d <&&> visit b
+          | .letE _ t v b _  => visit t <&&> visit v <&&> visit b
+          | _                => return true
 
 /--
 Check whether there are invalid occurrences of `mvarId` in the type of other metavariables in `v`.

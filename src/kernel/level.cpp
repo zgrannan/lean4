@@ -299,8 +299,32 @@ static level instantiate_core(level const & l, names const & ps, levels const & 
 }
 
 level instantiate(level const & l, names const & ps, levels const & ls) {
-    lean_assert(length(ps) == length(ls));
     return instantiate_core(l, ps, ls);
+}
+
+level instantiate(level const & l, size_t n, object * const * ps, object * const * ls) {
+    if (!has_param(l))
+        return l;
+    switch (l.kind()) {
+    case level_kind::Succ:
+        return update_succ(l, instantiate(succ_of(l), n, ps, ls));
+    case level_kind::Max: case level_kind::IMax: {
+        level l1 = instantiate(level_lhs(l), n, ps, ls);
+        level l2 = instantiate(level_rhs(l), n, ps, ls);
+        return update_max(l, l1, l2);
+    }
+    case level_kind::Param: {
+        object * id = param_id(l).raw();
+        for (size_t i = 0; i < n; ++i) {
+            if (lean_name_eq(ps[i], id))
+                return level(ls[i], true);
+        }
+        return l;
+    }
+    case level_kind::Zero: case level_kind::MVar:
+        return l;
+    }
+    lean_unreachable();
 }
 
 static void print(std::ostream & out, level l);

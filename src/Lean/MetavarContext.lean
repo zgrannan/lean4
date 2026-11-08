@@ -770,7 +770,9 @@ end DependsOn
   2- If `?m` is unassigned, then we consider the worst case and check whether `x` is in the local context of `?m`.
      This case is a "may dependency". That is, we may assign a term `t` to `?m` s.t. `t` contains `x`. -/
 @[inline] def findExprDependsOn [Monad m] [MonadMCtx m] (e : Expr) (pf : FVarId → Bool := fun _ => false) (pm : MVarId → Bool := fun _ => false) : m Bool := do
-  let (result, { mctx, .. }) := DependsOn.main pf pm e |>.run { mctx := (← getMCtx) }
+  if !e.hasFVar && !e.hasMVar then
+    return false
+  let (result, { mctx, .. }) := DependsOn.dep pf pm e |>.run { mctx := (← getMCtx) }
   setMCtx mctx
   return result
 
@@ -786,16 +788,20 @@ depends on a free variable `x` s.t. `pf x` is `true` or an unassigned metavariab
   | .ldecl (type := t) (value := v) (nondep := nondep) .. =>
     if generalizeNondepLet && nondep then
       findExprDependsOn t pf pm
+    else if !t.hasFVar && !t.hasMVar then
+      findExprDependsOn v pf pm
+    else if !v.hasFVar && !v.hasMVar then
+      findExprDependsOn t pf pm
     else
-      let (result, { mctx, .. }) := (DependsOn.main pf pm t <||> DependsOn.main pf pm v).run { mctx := (← getMCtx) }
+      let (result, { mctx, .. }) := (DependsOn.dep pf pm t <||> DependsOn.dep pf pm v).run { mctx := (← getMCtx) }
       setMCtx mctx
       return result
 
-def exprDependsOn [Monad m] [MonadMCtx m] (e : Expr) (fvarId : FVarId) : m Bool :=
+@[inline] def exprDependsOn [Monad m] [MonadMCtx m] (e : Expr) (fvarId : FVarId) : m Bool :=
   findExprDependsOn e (fvarId == ·)
 
 /-- Return true iff `e` depends on the free variable `fvarId` -/
-def dependsOn [Monad m] [MonadMCtx m] (e : Expr) (fvarId : FVarId) : m Bool :=
+@[inline] def dependsOn [Monad m] [MonadMCtx m] (e : Expr) (fvarId : FVarId) : m Bool :=
   exprDependsOn e fvarId
 
 /--
@@ -803,7 +809,7 @@ Returns true iff `localDecl` depends on the free variable `fvarId`
 - When `generalizeNondepLet := true` (the default), then values of nondependent lets are ignored,
   for computing dependencies from "within" a telescope.
 -/
-def localDeclDependsOn [Monad m] [MonadMCtx m] (localDecl : LocalDecl) (fvarId : FVarId) (generalizeNondepLet := true) : m Bool :=
+@[inline] def localDeclDependsOn [Monad m] [MonadMCtx m] (localDecl : LocalDecl) (fvarId : FVarId) (generalizeNondepLet := true) : m Bool :=
   findLocalDeclDependsOn localDecl (fvarId == ·) (generalizeNondepLet := generalizeNondepLet)
 
 /-- Similar to `exprDependsOn`, but `x` can be a free variable or an unassigned metavariable. -/

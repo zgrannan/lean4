@@ -294,16 +294,19 @@ private partial def checkAux (e : Expr) : MetaM Unit := do
   check e |>.run
 where
   check (e : Expr) : MonadCacheT ExprStructEq Unit MetaM Unit :=
-    checkCache { val := e : ExprStructEq } fun _ => do
-      match e with
-      | .forallE ..      => checkForall e
-      | .lam ..          => checkLambdaLet e
-      | .letE ..         => checkLambdaLet e
-      | .const c lvls    => checkConstant c lvls
-      | .app f a         => check f; check a; checkApp f a
-      | .mdata _ e       => check e
-      | .proj s i e      => check e; checkProj s i e
-      | _                => return ()
+    match e with
+    | .bvar .. | .lit .. | .fvar .. | .mvar .. | .sort .. => return ()
+    | .mdata _ e => check e
+    | _ =>
+      checkCache { val := e : ExprStructEq } fun _ => do
+        match e with
+        | .forallE ..      => checkForall e
+        | .lam ..          => checkLambdaLet e
+        | .letE ..         => checkLambdaLet e
+        | .const c lvls    => checkConstant c lvls
+        | .app f a         => check f; check a; checkApp f a
+        | .proj s i e      => check e; checkProj s i e
+        | _                => return ()
 
   checkLambdaLet (e : Expr) : MonadCacheT ExprStructEq Unit MetaM Unit :=
     lambdaLetTelescope e fun xs b => do

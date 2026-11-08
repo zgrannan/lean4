@@ -2219,6 +2219,7 @@ extern "C" LEAN_EXPORT bool lean_byte_array_lt(object * a1, object * a2) {
 
 // Constructor indices of `Ordering`: lt = 0, eq = 1, gt = 2.
 extern "C" LEAN_EXPORT uint8_t lean_string_compare(b_obj_arg s1, b_obj_arg s2) {
+    if (s1 == s2) return 1;
     size_t sz1 = lean_string_size(s1) - 1; // ignore null char in the end
     size_t sz2 = lean_string_size(s2) - 1; // ignore null char in the end
     int r      = std::memcmp(lean_string_cstr(s1), lean_string_cstr(s2), std::min(sz1, sz2));

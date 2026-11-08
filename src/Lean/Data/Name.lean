@@ -82,7 +82,9 @@ def cmp : Name → Name → Ordering
 def lt (x y : Name) : Bool :=
   cmp x y == Ordering.lt
 
-def quickCmpAux : Name → Name → Ordering
+@[extern "lean_name_quick_cmp_aux"]
+def quickCmpAux (n₁ : @& Name) (n₂ : @& Name) : Ordering :=
+  match n₁, n₂ with
   | anonymous, anonymous => Ordering.eq
   | anonymous, _         => Ordering.lt
   | _,         anonymous => Ordering.gt
@@ -111,8 +113,10 @@ def quickCmp (n₁ n₂ : Name) : Ordering :=
   | Ordering.eq => quickCmpAux n₁ n₂
   | ord => ord
 
-def quickLt (n₁ n₂ : Name) : Bool :=
-  quickCmp n₁ n₂ == Ordering.lt
+@[inline] def quickLt (n₁ n₂ : Name) : Bool :=
+  match quickCmp n₁ n₂ with
+  | Ordering.lt => true
+  | _ => false
 
 /-- Returns true if the name has any numeric components. -/
 def hasNum : Name → Bool

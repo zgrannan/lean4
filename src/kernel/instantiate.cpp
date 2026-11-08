@@ -271,6 +271,167 @@ expr apply_beta(expr f, unsigned num_rev_args, expr const * rev_args, bool prese
     return apply_beta_rec(f, 0, num_rev_args, rev_args, preserve_data, zeta);
 }
 
+class instantiate_beta_rev_fn {
+    replace_cache &  m_cache;
+    size_t           m_n;
+    object * const * m_subst;
+    uint32_t         m_epoch;
+
+    expr save_result(expr const & e, unsigned offset, expr r, bool shared) {
+        if (shared) {
+            m_cache.insert(e.raw(), offset, m_epoch, r.raw());
+        }
+        return r;
+    }
+
+    expr visit_bvar(expr const & m, unsigned offset) const {
+        nat const & vidx = bvar_idx(m);
+        if (vidx.is_small()) {
+            size_t idx = vidx.get_small_value();
+            if (idx >= offset) {
+                size_t h = offset + m_n;
+                if (h < offset || idx < h) {
+                    object * v = m_subst[m_n - (idx - offset) - 1];
+                    return lift_loose_bvars(TO_REF(expr, v), offset);
+                } else {
+                    return mk_bvar(nat::of_size_t(idx - m_n));
+                }
+            }
+        } else if (vidx >= offset) {
+            size_t h = offset + m_n;
+            if (h < offset) {
+                object * v = m_subst[m_n - (vidx.get_small_value() - offset) - 1];
+                return lift_loose_bvars(TO_REF(expr, v), offset);
+            } else {
+                return mk_bvar(vidx - nat::of_size_t(m_n));
+            }
+        }
+        return m;
+    }
+
+    expr visit_without_beta(expr const & e, unsigned offset) {
+        if (offset >= get_loose_bvar_range(e))
+            return e;
+        if (is_app(e)) {
+            bool shared = false;
+            if (!is_likely_unshared(e)) {
+                if (lean_object * cached = m_cache.find(e.raw(), offset, m_epoch))
+                    return expr(cached, true);
+                shared = true;
+            }
+            expr new_f = visit_without_beta(app_fn(e), offset);
+            expr new_a = visit(app_arg(e), offset);
+            return save_result(e, offset, update_app(e, new_f, new_a), shared);
+        } else {
+            return visit(e, offset);
+        }
+    }
+
+    expr visit(expr const & e, unsigned offset) {
+        if (offset >= get_loose_bvar_range(e))
+            return e;
+        if (is_bvar(e))
+            return visit_bvar(e, offset);
+        bool shared = false;
+        if (!is_likely_unshared(e)) {
+            if (lean_object * cached = m_cache.find(e.raw(), offset, m_epoch))
+                return expr(cached, true);
+            shared = true;
+        }
+        switch (e.kind()) {
+        case expr_kind::BVar:
+            lean_unreachable();
+        case expr_kind::Const: case expr_kind::FVar:
+        case expr_kind::MVar:  case expr_kind::Sort:
+        case expr_kind::Lit:
+            return e;
+        case expr_kind::MData: {
+            expr new_e = visit(mdata_expr(e), offset);
+            return save_result(e, offset, update_mdata(e, new_e), shared);
+        }
+        case expr_kind::Proj: {
+            expr new_e = visit(proj_expr(e), offset);
+            return save_result(e, offset, update_proj(e, new_e), shared);
+        }
+        case expr_kind::Pi: case expr_kind::Lambda: {
+            expr new_d = visit(binding_domain(e), offset);
+            expr new_b = visit(binding_body(e), offset + 1);
+            return save_result(e, offset, update_binding(e, new_d, new_b), shared);
+        }
+        case expr_kind::Let: {
+            expr new_t = visit(let_type(e), offset);
+            expr new_v = visit(let_value(e), offset);
+            expr new_b = visit(let_body(e), offset + 1);
+            return save_result(e, offset, update_let(e, new_t, new_v, new_b), shared);
+        }
+        case expr_kind::App: {
+            expr const & head = get_app_fn(e);
+            if (is_bvar(head)) {
+                expr new_head = visit(head, offset);
+                buffer<expr> rev_args;
+                get_app_rev_args(e, rev_args);
+                for (expr & arg : rev_args) {
+                    arg = visit(arg, offset);
+                }
+                expr r = apply_beta(new_head, rev_args.size(), rev_args.data(), false, false);
+                return save_result(e, offset, std::move(r), shared);
+            } else {
+                expr new_f = visit_without_beta(app_fn(e), offset);
+                expr new_a = visit(app_arg(e), offset);
+                return save_result(e, offset, update_app(e, new_f, new_a), shared);
+            }
+        }
+        }
+        lean_unreachable();
+    }
+
+public:
+    instantiate_beta_rev_fn(size_t n, object * const * subst):
+        m_cache(get_thread_replace_cache()),
+        m_n(n),
+        m_subst(subst),
+        m_epoch(m_cache.enter()) {}
+    ~instantiate_beta_rev_fn() {
+        m_cache.leave();
+    }
+    expr operator()(expr const & e) { return visit(e, 0); }
+};
+
+extern "C" LEAN_EXPORT object * lean_expr_instantiate_beta_rev_range(b_obj_arg a0, b_obj_arg begin, b_obj_arg end, b_obj_arg subst) {
+    if (!lean_is_scalar(begin) || !lean_is_scalar(end)) {
+        lean_internal_panic("invalid range for Expr.instantiateBetaRevRange");
+    }
+    expr const & a = TO_REF(expr, a0);
+    usize b = lean_unbox(begin);
+    usize e = lean_unbox(end);
+    if (!has_loose_bvars(a) || e <= b) {
+        lean_inc(a0);
+        return a0;
+    }
+    usize sz = lean_array_size(subst);
+    if (e > sz) {
+        lean_internal_panic("invalid range for Expr.instantiateBetaRevRange");
+    }
+    size_t n = e - b;
+    object ** s = lean_array_cptr(subst) + b;
+    bool has_lam = false;
+    for (size_t i = 0; i < n; ++i) {
+        object * curr = s[i];
+        while (expr_kind_core(curr) == expr_kind::MData) {
+            curr = lean_ctor_get(curr, 1);
+        }
+        if (expr_kind_core(curr) == expr_kind::Lambda) {
+            has_lam = true;
+            break;
+        }
+    }
+    if (!has_lam) {
+        return lean_expr_instantiate_rev_core(a0, n, s);
+    }
+    expr r = instantiate_beta_rev_fn(n, s)(a);
+    return r.steal();
+}
+
 expr cheap_beta_reduce(expr const & e) {
     if (!is_app(e)) return e;
     expr fn = get_app_fn(e);
@@ -420,6 +581,51 @@ expr instantiate_value_lparams(constant_info const & info, levels const & ls) {
     if (is_nil(ls) || !has_param_univ(info.get_value()))
         return info.get_value();
     return instantiate_lparams_cached(info.get_value(), info.get_lparams(), ls);
+}
+
+extern "C" LEAN_EXPORT obj_res lean_expr_instantiate_lparams(b_obj_arg e_obj, b_obj_arg lps_obj, b_obj_arg ls_obj) {
+    expr const & e = TO_REF(expr, e_obj);
+    names const & lps = TO_REF(names, lps_obj);
+    levels const & ls = TO_REF(levels, ls_obj);
+    if (is_nil(lps) || is_nil(ls) || !has_param_univ(e)) {
+        lean_inc(e_obj);
+        return e_obj;
+    }
+    return instantiate_lparams_cached(e, lps, ls).steal();
+}
+
+struct instantiate_lparams_array_policy {
+    static constexpr bool only_atomic = false;
+    size_t           m_n;
+    object * const * m_ps;
+    object * const * m_ls;
+    bool should_return_self(expr const & e, unsigned) const {
+        return !has_param_univ(e);
+    }
+    expr visit_atomic(expr const & e, unsigned) const { return e; }
+    optional<expr> visit(expr const & e, unsigned) const {
+        if (is_constant(e)) {
+            return some_expr(update_constant(e, map_reuse(const_levels(e), [&](level const & l) { return instantiate(l, m_n, m_ps, m_ls); })));
+        } else if (is_sort(e)) {
+            return some_expr(update_sort(e, instantiate(sort_level(e), m_n, m_ps, m_ls)));
+        } else {
+            return none_expr();
+        }
+    }
+};
+
+extern "C" LEAN_EXPORT obj_res lean_expr_instantiate_lparams_array(b_obj_arg e_obj, b_obj_arg ps_arr, b_obj_arg ls_arr) {
+    expr const & e = TO_REF(expr, e_obj);
+    size_t n_ps = lean_array_size(ps_arr);
+    size_t n_ls = lean_array_size(ls_arr);
+    size_t n = std::min(n_ps, n_ls);
+    if (n == 0 || !has_param_univ(e)) {
+        lean_inc(e_obj);
+        return e_obj;
+    }
+    kernel_arena_pause_scope pause;
+    expr res = replace_custom(e, instantiate_lparams_array_policy{n, lean_array_cptr(ps_arr), lean_array_cptr(ls_arr)});
+    return res.steal();
 }
 
 }

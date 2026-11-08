@@ -32,7 +32,8 @@ private def getParamSubst : List Name → List Level → Name → Option Level
 Instantiate universe level parameters names `paramNames` with `lvls` in `e`.
 If the two lists have different length, the smallest one is used.
 -/
-def instantiateLevelParams (e : Expr) (paramNames : List Name) (lvls : List Level) : Expr :=
+@[extern "lean_expr_instantiate_lparams"]
+def instantiateLevelParams (e : @& Expr) (paramNames : @& List Name) (lvls : @& List Level) : Expr :=
   if paramNames.isEmpty || lvls.isEmpty then e else
     instantiateLevelParamsCore (getParamSubst paramNames lvls) e
 
@@ -58,7 +59,8 @@ private partial def getParamSubstArray (ps : Array Name) (us : Array Level) (p' 
 Instantiate universe level parameters names `paramNames` with `lvls` in `e`.
 If the two arrays have different length, the smallest one is used.
 -/
-def instantiateLevelParamsArray (e : Expr) (paramNames : Array Name) (lvls : Array Level) : Expr :=
+@[extern "lean_expr_instantiate_lparams_array"]
+def instantiateLevelParamsArray (e : @& Expr) (paramNames : @& Array Name) (lvls : @& Array Level) : Expr :=
   if paramNames.isEmpty || lvls.isEmpty then e else
     e.instantiateLevelParamsCore fun p =>
       getParamSubstArray paramNames lvls p 0

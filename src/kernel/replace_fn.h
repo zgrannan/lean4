@@ -134,7 +134,7 @@ class replace_custom_fn {
         case expr_kind::Const: case expr_kind::Sort:
         case expr_kind::BVar:  case expr_kind::Lit:
         case expr_kind::MVar:  case expr_kind::FVar:
-            return save_result(e, offset, e, shared);
+            return e;
         case expr_kind::MData: {
             expr new_e = apply(mdata_expr(e), offset);
             return save_result(e, offset, update_mdata(e, new_e), shared);

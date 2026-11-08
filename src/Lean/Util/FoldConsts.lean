@@ -43,7 +43,8 @@ unsafe def fold {α : Type} (f : Name → α → α) (e : Expr) (acc : α) : Fol
     | _ => return acc
   visit e acc
 
-@[inline] unsafe def foldUnsafe {α : Type} (e : Expr) (init : α) (f : Name → α → α) : α :=
+@[extern "lean_expr_fold_consts"]
+unsafe def foldUnsafe {α : Type} (e : Expr) (init : α) (f : Name → α → α) : α :=
   (fold f e init).run' {}
 
 end FoldConstsImpl

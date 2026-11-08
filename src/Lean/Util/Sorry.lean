@@ -25,7 +25,8 @@ def Expr.isSyntheticSorry (e : Expr) : Bool :=
 def Expr.isNonSyntheticSorry (e : Expr) : Bool :=
   e.isAppOf ``sorryAx && e.getAppNumArgs ≥ 2 && (e.getArg! 1).isConstOf ``Bool.false
 
-def Expr.hasSorry (e : Expr) : Bool :=
+@[extern "lean_expr_has_sorry"]
+def Expr.hasSorry (e : @& Expr) : Bool :=
   Option.isSome <| e.find? (·.isConstOf ``sorryAx)
 
 def Expr.hasSyntheticSorry (e : Expr) : Bool :=

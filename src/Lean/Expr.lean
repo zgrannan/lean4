@@ -1143,17 +1143,21 @@ def isAppOf (e : Expr) (n : Name) : Bool :=
 Given `f a₁ ... aᵢ`, returns true if `f` is a constant
 with name `n` and has the correct number of arguments.
 -/
-def isAppOfArity : Expr → Name → Nat → Bool
-  | const c _, n, 0   => c == n
-  | app f _,   n, a+1 => isAppOfArity f n a
-  | _,         _, _   => false
+@[extern "lean_expr_is_app_of_arity"]
+def isAppOfArity (e : @& Expr) (n : @& Name) (a : @& Nat) : Bool :=
+  match e, a with
+  | const c _, 0   => c == n
+  | app f _,   a+1 => isAppOfArity f n a
+  | _,         _   => false
 
 /-- Similar to `isAppOfArity` but skips `Expr.mdata`. -/
-def isAppOfArity' : Expr → Name → Nat → Bool
-  | mdata _ b , n, a   => isAppOfArity' b n a
-  | const c _,  n, 0   => c == n
-  | app f _,    n, a+1 => isAppOfArity' f n a
-  | _,          _,  _   => false
+@[extern "lean_expr_is_app_of_arity_prime"]
+def isAppOfArity' (e : @& Expr) (n : @& Name) (a : @& Nat) : Bool :=
+  match e, a with
+  | mdata _ b , a   => isAppOfArity' b n a
+  | const c _,  0   => c == n
+  | app f _,    a+1 => isAppOfArity' f n a
+  | _,          _   => false
 
 private def getAppNumArgsAux : Expr → Nat → Nat
   | app f _, n => getAppNumArgsAux f (n+1)
@@ -1691,33 +1695,33 @@ def etaExpandedStrict? : Expr → Option Expr
   | _           => none
 
 /-- Return `some e'` if `e` is of the form `optParam _ e'` -/
-def getOptParamDefault? (e : Expr) : Option Expr :=
+@[inline] def getOptParamDefault? (e : Expr) : Option Expr :=
   if e.isAppOfArity ``optParam 2 then
     some e.appArg!
   else
     none
 
 /-- Return `some e'` if `e` is of the form `autoParam _ e'` -/
-def getAutoParamTactic? (e : Expr) : Option Expr :=
+@[inline] def getAutoParamTactic? (e : Expr) : Option Expr :=
   if e.isAppOfArity ``autoParam 2 then
     some e.appArg!
   else
     none
 
 /-- Return `true` if `e` is of the form `outParam _` -/
-def isOutParam (e : Expr) : Bool :=
+@[inline] def isOutParam (e : Expr) : Bool :=
   e.isAppOfArity ``outParam 1
 
 /-- Return `true` if `e` is of the form `semiOutParam _` -/
-def isSemiOutParam (e : Expr) : Bool :=
+@[inline] def isSemiOutParam (e : Expr) : Bool :=
   e.isAppOfArity ``semiOutParam 1
 
 /-- Return `true` if `e` is of the form `optParam _ _` -/
-def isOptParam (e : Expr) : Bool :=
+@[inline] def isOptParam (e : Expr) : Bool :=
   e.isAppOfArity ``optParam 2
 
 /-- Return `true` if `e` is of the form `autoParam _ _` -/
-def isAutoParam (e : Expr) : Bool :=
+@[inline] def isAutoParam (e : Expr) : Bool :=
   e.isAppOfArity ``autoParam 2
 
 /-- Returns `true` if `e` is an application of one of the type annotation gadgets. This does not check that the application has the correct arity. -/

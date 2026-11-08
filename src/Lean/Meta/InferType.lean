@@ -34,7 +34,8 @@ This function reduces the new application to `f m = f n`.
 
 We use this to implement `inferAppType`.
 -/
-partial def Expr.instantiateBetaRevRange (e : Expr) (start : Nat) (stop : Nat) (args : Array Expr) : Expr :=
+@[extern "lean_expr_instantiate_beta_rev_range"]
+partial def Expr.instantiateBetaRevRange (e : @& Expr) (start : @& Nat) (stop : @& Nat) (args : @& Array Expr) : Expr :=
   if e.hasLooseBVars && stop > start then
     assert! stop ≤ args.size
     if args.any (·.consumeMData.isLambda) start stop then

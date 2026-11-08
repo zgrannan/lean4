@@ -176,9 +176,9 @@ template<typename F> level replace(level const & l, F const & f) { return replac
 /** \brief If \c l contains a parameter that is not in \c ps, then return it. Otherwise, return none. */
 optional<name> get_undef_param(level const & l, names const & lparams);
 
-/** \brief Instantiate the universe level parameters \c ps occurring in \c l with the levels \c ls.
-    \pre length(ps) == length(ls) */
+/** \brief Instantiate the universe level parameters \c ps occurring in \c l with the levels \c ls. */
 level instantiate(level const & l, names const & ps, levels const & ls);
+level instantiate(level const & l, size_t n, object * const * ps, object * const * ls);
 
 /** \brief Printer for debugging purposes */
 std::ostream & operator<<(std::ostream & out, level const & l);

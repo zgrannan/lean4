@@ -1151,6 +1151,9 @@ struct depends_on_fn {
     }
 
     bool visit(lean_object * e) {
+        if (lean_obj_tag(e) == 1) {
+            return eval_pred(m_pf, lean_ctor_get(e, 0));
+        }
         if (!should_visit(e)) {
             return false;
         }

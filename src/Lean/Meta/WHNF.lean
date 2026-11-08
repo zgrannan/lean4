@@ -481,7 +481,7 @@ Eagerly unfold `dite` constants in `e`. This is an auxiliary function used to re
 See comment above.
 -/
 private def unfoldNestedDIte (e : Expr) : CoreM Expr := do
-  if e.find? (fun e => e.isAppOf ``dite) matches some _ then
+  if e.find? (fun e => e.isConstOf ``dite) matches some _ then
     Core.transform e fun e => do
       if let .const ``dite us := e then
         let constInfo ← getConstInfo ``dite

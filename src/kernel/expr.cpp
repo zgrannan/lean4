@@ -873,6 +873,36 @@ extern "C" LEAN_EXPORT object * lean_expr_lift_loose_bvars(b_obj_arg e, b_obj_ar
     return lift_loose_bvars(TO_REF(expr, e), lean_unbox(s), lean_unbox(d)).steal();
 }
 
+extern "C" LEAN_EXPORT uint8 lean_expr_is_app_of_arity(b_obj_arg e, b_obj_arg n, b_obj_arg a_obj) {
+    if (!lean_is_scalar(a_obj)) return 0;
+    size_t a = lean_unbox(a_obj);
+    while (a > 0) {
+        if (expr_kind_core(e) != expr_kind::App) return 0;
+        e = lean_ctor_get(e, 0);
+        --a;
+    }
+    if (expr_kind_core(e) != expr_kind::Const) return 0;
+    return lean_name_eq(lean_ctor_get(e, 0), n);
+}
+
+extern "C" LEAN_EXPORT uint8 lean_expr_is_app_of_arity_prime(b_obj_arg e, b_obj_arg n, b_obj_arg a_obj) {
+    if (!lean_is_scalar(a_obj)) return 0;
+    size_t a = lean_unbox(a_obj);
+    while (true) {
+        expr_kind k = expr_kind_core(e);
+        if (k == expr_kind::MData) {
+            e = lean_ctor_get(e, 1);
+        } else if (a > 0) {
+            if (k != expr_kind::App) return 0;
+            e = lean_ctor_get(e, 0);
+            --a;
+        } else {
+            if (k != expr_kind::Const) return 0;
+            return lean_name_eq(lean_ctor_get(e, 0), n);
+        }
+    }
+}
+
 // =======================================
 // Implicit argument inference
 

@@ -212,5 +212,35 @@ name name::replace_prefix(name const & prefix, name const & new_prefix) const {
 
 void initialize_name() {}
 void finalize_name() {}
+
+extern "C" LEAN_EXPORT uint8 lean_name_quick_cmp_aux(b_obj_arg n1, b_obj_arg n2) {
+    while (true) {
+        if (n1 == n2) return 1;
+        if (lean_is_scalar(n1)) return 0;
+        if (lean_is_scalar(n2)) return 2;
+        unsigned tag1 = lean_obj_tag(n1);
+        unsigned tag2 = lean_obj_tag(n2);
+        if (tag1 != tag2) return tag1 == 1 ? 2 : 0;
+        lean_object * f1 = lean_ctor_get(n1, 1);
+        lean_object * f2 = lean_ctor_get(n2, 1);
+        if (f1 != f2) {
+            if (tag1 == 1) {
+                uint8 r = lean_string_compare(f1, f2);
+                if (r != 1) return r;
+            } else {
+                if (lean_is_scalar(f1) && lean_is_scalar(f2)) {
+                    size_t v1 = lean_unbox(f1);
+                    size_t v2 = lean_unbox(f2);
+                    if (v1 != v2) return v1 < v2 ? 0 : 2;
+                } else {
+                    if (lean_nat_dec_lt(f1, f2)) return 0;
+                    if (!lean_nat_dec_eq(f1, f2)) return 2;
+                }
+            }
+        }
+        n1 = lean_ctor_get(n1, 0);
+        n2 = lean_ctor_get(n2, 0);
+    }
+}
 }
 void print(lean::name const & n) { std::cout << n << std::endl; }
