@@ -315,18 +315,21 @@ struct lparams_cache {
     static constexpr size_t CAPACITY = 16384;
     static constexpr size_t MASK = CAPACITY - 1;
     struct slot {
-        lean_object * m_expr = nullptr;
-        lean_object * m_lps  = nullptr;
-        lean_object * m_ls   = nullptr;
-        lean_object * m_res  = nullptr;
-        ~slot() {
-            if (m_expr) lean_dec(m_expr);
-            if (m_lps)  lean_dec(m_lps);
-            if (m_ls)   lean_dec(m_ls);
-            if (m_res)  lean_dec(m_res);
-        }
+        lean_object * m_expr;
+        lean_object * m_lps;
+        lean_object * m_ls;
+        lean_object * m_res;
     };
     slot m_slots[CAPACITY];
+
+    ~lparams_cache() {
+        for (size_t i = 0; i < CAPACITY; ++i) {
+            if (m_slots[i].m_expr) lean_dec(m_slots[i].m_expr);
+            if (m_slots[i].m_lps)  lean_dec(m_slots[i].m_lps);
+            if (m_slots[i].m_ls)   lean_dec(m_slots[i].m_ls);
+            if (m_slots[i].m_res)  lean_dec(m_slots[i].m_res);
+        }
+    }
 
     static unsigned hash_levels(levels const & ls) {
         unsigned h = 23;

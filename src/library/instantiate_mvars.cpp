@@ -124,19 +124,19 @@ struct direct_mvars_tls {
     static constexpr size_t NAME_MASK  = NAME_CAP - 1;
 
     struct kv_slot {
-        lean_object * key   = nullptr;
-        lean_object * val   = nullptr;
-        uint32_t      epoch = 0;
+        lean_object * key;
+        lean_object * val;
+        uint32_t      epoch;
     };
     struct key_slot {
-        lean_object * key   = nullptr;
-        uint32_t      epoch = 0;
+        lean_object * key;
+        uint32_t      epoch;
     };
 
     kv_slot  m_levels[LEVEL_CAP];
     kv_slot  m_exprs[EXPR_CAP];
     key_slot m_names[NAME_CAP];
-    uint32_t m_epoch = 1;
+    uint32_t m_epoch = 0;
     unsigned m_depth = 0;
     std::vector<lean_object *> m_to_dec;
 
@@ -146,7 +146,7 @@ struct direct_mvars_tls {
         }
     }
 
-    uint32_t enter() {
+    direct_mvars_tls * enter(uint32_t & out_ep) {
         ++m_depth;
         ++m_epoch;
         if (LEAN_UNLIKELY(m_epoch == 0)) {
@@ -155,7 +155,8 @@ struct direct_mvars_tls {
             for (size_t i = 0; i < NAME_CAP; ++i)  m_names[i].epoch  = 0;
             m_epoch = 1;
         }
-        return m_epoch;
+        out_ep = m_epoch;
+        return this;
     }
 
     void leave() {
@@ -250,24 +251,25 @@ static thread_local direct_mvars_tls g_direct_mvars_tls;
 
 /* Level metavariable instantiation. */
 class instantiate_lmvars_all_fn {
-    metavar_ctx & m_mctx;
-    uint32_t      m_epoch;
-    bool          m_own_scope;
+    metavar_ctx &      m_mctx;
+    direct_mvars_tls * m_tables;
+    uint32_t           m_epoch;
+    bool               m_own_scope;
 
     inline level cache(level const & l, level r, bool shared) {
         if (shared) {
-            g_direct_mvars_tls.insert_level(l.raw(), r.raw(), m_epoch);
+            m_tables->insert_level(l.raw(), r.raw(), m_epoch);
         }
         return r;
     }
 public:
-    instantiate_lmvars_all_fn(metavar_ctx & mctx, uint32_t epoch, bool own_scope)
-        : m_mctx(mctx), m_epoch(epoch), m_own_scope(own_scope) {}
+    instantiate_lmvars_all_fn(metavar_ctx & mctx, direct_mvars_tls * tables, uint32_t epoch, bool own_scope)
+        : m_mctx(mctx), m_tables(tables), m_epoch(epoch), m_own_scope(own_scope) {}
     explicit instantiate_lmvars_all_fn(metavar_ctx & mctx)
-        : m_mctx(mctx), m_epoch(g_direct_mvars_tls.enter()), m_own_scope(true) {}
+        : m_mctx(mctx), m_tables(g_direct_mvars_tls.enter(m_epoch)), m_own_scope(true) {}
     ~instantiate_lmvars_all_fn() {
         if (m_own_scope) {
-            g_direct_mvars_tls.leave();
+            m_tables->leave();
         }
     }
     level visit(level const & l) {
@@ -275,7 +277,7 @@ public:
             return l;
         bool shared = false;
         if (is_shared(l)) {
-            if (lean_object * cached = g_direct_mvars_tls.find_level(l.raw(), m_epoch)) {
+            if (lean_object * cached = m_tables->find_level(l.raw(), m_epoch)) {
                 return level(cached, true);
             }
             shared = true;
@@ -298,7 +300,7 @@ public:
                 } else {
                     level a_new = visit(a);
                     if (!is_eqp(a, a_new)) {
-                        g_direct_mvars_tls.save_obj(a.raw());
+                        m_tables->save_obj(a.raw());
                         assign_lmvar(m_mctx, mvar_id(l), a_new);
                     }
                     return a_new;
@@ -319,8 +321,9 @@ public:
    ============================================================================ */
 
 class instantiate_direct_fn {
-    metavar_ctx & m_mctx;
-    uint32_t      m_epoch;
+    metavar_ctx &             m_mctx;
+    direct_mvars_tls *        m_tables;
+    uint32_t                  m_epoch;
     instantiate_lmvars_all_fn m_level_fn;
     /* Set to true when a delayed-assigned MVar with an assigned pending MVar
        is encountered. Pass 2 is needed to resolve or write back such MVars. */
@@ -336,7 +339,7 @@ class instantiate_direct_fn {
 
     inline expr cache(expr const & e, expr r, bool shared) {
         if (shared) {
-            g_direct_mvars_tls.insert_expr(e.raw(), r.raw(), m_epoch);
+            m_tables->insert_expr(e.raw(), r.raw(), m_epoch);
         }
         return r;
     }
@@ -349,12 +352,12 @@ class instantiate_direct_fn {
             return optional<expr>();
         }
         expr a(r.get_val());
-        if (!has_mvar(a) || g_direct_mvars_tls.check_and_insert_name(mid, m_epoch)) {
+        if (!has_mvar(a) || m_tables->check_and_insert_name(mid, m_epoch)) {
             return optional<expr>(a);
         }
         expr a_new = visit(a);
         if (!is_eqp(a, a_new)) {
-            g_direct_mvars_tls.save_obj(a.raw());
+            m_tables->save_obj(a.raw());
             assign_mvar(m_mctx, mid, a_new);
         }
         return optional<expr>(a_new);
@@ -424,9 +427,9 @@ class instantiate_direct_fn {
 
 public:
     instantiate_direct_fn(metavar_ctx & mctx)
-        : m_mctx(mctx), m_epoch(g_direct_mvars_tls.enter()), m_level_fn(mctx, m_epoch, false), m_has_updateable_delayed(false) {}
+        : m_mctx(mctx), m_tables(g_direct_mvars_tls.enter(m_epoch)), m_level_fn(mctx, m_tables, m_epoch, false), m_has_updateable_delayed(false) {}
     ~instantiate_direct_fn() {
-        g_direct_mvars_tls.leave();
+        m_tables->leave();
     }
     bool has_updateable_delayed() const { return m_has_updateable_delayed; }
 
@@ -435,7 +438,7 @@ public:
             return e;
         bool shared = false;
         if (is_shared(e)) {
-            if (lean_object * cached = g_direct_mvars_tls.find_expr(e.raw(), m_epoch)) {
+            if (lean_object * cached = m_tables->find_expr(e.raw(), m_epoch)) {
                 return expr(cached, true);
             }
             shared = true;
@@ -1035,5 +1038,246 @@ extern "C" LEAN_EXPORT object * lean_instantiate_level_mvars(object * m, object 
 
 extern "C" LEAN_EXPORT object * lean_instantiate_expr_mvars(object * m, object * e) {
     return run_instantiate_all(m, e);
+}
+
+/* ============================================================================
+   Thread-local epoch-tagged flat table for `Lean.MetavarContext.DependsOn`.
+   Replaces the per-call heap-allocated `Std.DHashMap` (`ExprSet`) and
+   eliminates per-node `StateM` (`Prod`) allocations and child reference counting.
+   ============================================================================ */
+
+extern "C" lean_object * l_Lean_instantiateMVarsCore(lean_object * mctx, lean_object * e);
+extern "C" lean_object * l_Lean_MetavarContext_getExprAssignmentCore_x3f(lean_object * mctx, lean_object * mvarId);
+extern "C" lean_object * l_Lean_MetavarContext_getDecl(lean_object * mctx, lean_object * mvarId);
+extern "C" uint8_t l_Lean_PersistentArray_anyM___at___00__private_Lean_MetavarContext_0__Lean_DependsOn_dep_visitMain_spec__3(
+    uint8_t init_false, lean_object * pf, lean_object * decls);
+extern "C" uint8_t lean_expr_eqv(b_lean_obj_arg a, b_lean_obj_arg b);
+
+struct depends_on_tls {
+    static constexpr size_t CAP  = 65536;
+    static constexpr size_t MASK = CAP - 1;
+
+    struct slot {
+        lean_object * key;
+        uint32_t      hash;
+        uint32_t      epoch;
+    };
+
+    slot     m_slots[CAP];
+    uint32_t m_epoch = 0;
+
+    slot * enter(uint32_t & out_ep) {
+        uint32_t ep = ++m_epoch;
+        if (LEAN_UNLIKELY(ep == 0)) {
+            for (size_t i = 0; i < CAP; ++i) m_slots[i].epoch = 0;
+            ep = m_epoch = 1;
+        }
+        out_ep = ep;
+        return m_slots;
+    }
+};
+
+static thread_local depends_on_tls g_depends_on_tls;
+
+static inline bool has_fvar_or_expr_mvar(lean_object * e) {
+    return (get_data(TO_REF(expr, e)) & (3ULL << 40)) != 0;
+}
+
+static inline lean_object * get_app_fn_raw(lean_object * e) {
+    while (lean_obj_tag(e) == 5) {
+        e = lean_ctor_get(e, 0);
+    }
+    return e;
+}
+
+static inline lean_object * get_app_fn_mvar_raw(lean_object * e) {
+    if (!has_expr_mvar(TO_REF(expr, e))) return nullptr;
+    while (lean_obj_tag(e) == 5) {
+        e = lean_ctor_get(e, 0);
+        if (!has_expr_mvar(TO_REF(expr, e))) return nullptr;
+    }
+    return lean_obj_tag(e) == 2 ? e : nullptr;
+}
+
+struct depends_on_fn {
+    lean_object *             m_pf;
+    lean_object *             m_pm;
+    lean_object *             m_mctx;
+    depends_on_tls::slot *    m_slots;
+    uint32_t                  m_epoch;
+    buffer<lean_object *, 16> m_temps;
+
+    depends_on_fn(lean_object * pf, lean_object * pm, lean_object * mctx)
+        : m_pf(pf), m_pm(pm), m_mctx(mctx), m_slots(g_depends_on_tls.enter(m_epoch)) {}
+
+    ~depends_on_fn() {
+        for (lean_object * o : m_temps) {
+            lean_dec(o);
+        }
+    }
+
+    inline bool should_visit(lean_object * e) {
+        uint64_t d = get_data(TO_REF(expr, e));
+        if ((d & (3ULL << 40)) == 0) {
+            return false;
+        }
+        uint32_t h = static_cast<uint32_t>(d);
+        uint32_t ep = m_epoch;
+        depends_on_tls::slot * slots = m_slots;
+        size_t idx = h & depends_on_tls::MASK;
+        size_t target = (idx + 31) & depends_on_tls::MASK;
+        for (size_t i = 0; i < 32; ++i) {
+            size_t cur = (idx + i) & depends_on_tls::MASK;
+            depends_on_tls::slot const & s = slots[cur];
+            if (s.epoch != ep) {
+                target = cur;
+                break;
+            }
+            if (s.key == e || (s.hash == h && lean_expr_eqv(s.key, e))) {
+                return false;
+            }
+        }
+        slots[target].key   = e;
+        slots[target].hash  = h;
+        slots[target].epoch = ep;
+        return true;
+    }
+
+    inline bool eval_pred(lean_object * pred, lean_object * id) {
+        lean_inc_ref(pred);
+        lean_inc(id);
+        lean_object * r = lean_apply_1(pred, id);
+        return lean_unbox(r) != 0;
+    }
+
+    bool visit(lean_object * e) {
+        if (!should_visit(e)) {
+            return false;
+        }
+        return visit_main(e);
+    }
+
+    bool visit_app(lean_object * e) {
+        if (lean_obj_tag(e) == 5) {
+            lean_object * fn  = lean_ctor_get(e, 0);
+            lean_object * arg = lean_ctor_get(e, 1);
+            if (has_fvar_or_expr_mvar(fn)) {
+                if (lean_obj_tag(fn) == 5) {
+                    if (visit_app(fn)) return true;
+                } else {
+                    if (visit(fn)) return true;
+                }
+            }
+            return visit(arg);
+        }
+        return visit(e);
+    }
+
+    bool visit_main(lean_object * e) {
+    start:
+        switch (static_cast<expr_kind>(lean_obj_tag(e))) {
+        case expr_kind::Proj:
+            return visit(lean_ctor_get(e, 2));
+        case expr_kind::Pi:
+        case expr_kind::Lambda:
+            return visit(lean_ctor_get(e, 1)) || visit(lean_ctor_get(e, 2));
+        case expr_kind::Let:
+            return visit(lean_ctor_get(e, 1)) || visit(lean_ctor_get(e, 2)) || visit(lean_ctor_get(e, 3));
+        case expr_kind::MData:
+            return visit(lean_ctor_get(e, 1));
+        case expr_kind::App: {
+            lean_object * f = get_app_fn_mvar_raw(e);
+            if (f != nullptr) {
+                lean_inc_ref(e);
+                lean_object * res = l_Lean_instantiateMVarsCore(m_mctx, e);
+                lean_object * e_prime = lean_ctor_get(res, 0);
+                lean_inc(e_prime);
+                m_mctx = lean_ctor_get(res, 1);
+                lean_inc(m_mctx);
+                lean_dec_ref(res);
+                m_temps.push_back(e_prime);
+                lean_object * f_prime = get_app_fn_raw(e_prime);
+                if (!lean_expr_eqv(f_prime, f)) {
+                    e = e_prime;
+                    goto start;
+                }
+                if (eval_pred(m_pm, lean_ctor_get(f, 0))) {
+                    return true;
+                }
+                return visit_app(e);
+            }
+            return visit_app(e);
+        }
+        case expr_kind::MVar: {
+            lean_object * mvar_id = lean_ctor_get(e, 0);
+            lean_object * opt = l_Lean_MetavarContext_getExprAssignmentCore_x3f(m_mctx, mvar_id);
+            if (lean_obj_tag(opt) != 0) {
+                lean_object * a = lean_ctor_get(opt, 0);
+                lean_inc(a);
+                lean_dec_ref(opt);
+                m_temps.push_back(a);
+                return visit(a);
+            }
+            if (eval_pred(m_pm, mvar_id)) {
+                return true;
+            }
+            lean_inc(mvar_id);
+            lean_object * decl  = l_Lean_MetavarContext_getDecl(m_mctx, mvar_id);
+            lean_object * lctx  = lean_ctor_get(decl, 1);
+            lean_object * decls = lean_ctor_get(lctx, 1);
+            lean_inc_ref(m_pf);
+            uint8_t r = l_Lean_PersistentArray_anyM___at___00__private_Lean_MetavarContext_0__Lean_DependsOn_dep_visitMain_spec__3(
+                0, m_pf, decls);
+            lean_dec_ref(decl);
+            return r != 0;
+        }
+        case expr_kind::FVar:
+            return eval_pred(m_pf, lean_ctor_get(e, 0));
+        default:
+            return false;
+        }
+    }
+};
+
+extern "C" LEAN_EXPORT lean_object * lean_depends_on_dep_visit(
+    lean_object * v_pf, lean_object * v_pm, lean_object * v_e, lean_object * v_state) {
+    lean_object * visited = lean_ctor_get(v_state, 0);
+    lean_object * mctx    = lean_ctor_get(v_state, 1);
+    lean_object * reuse_state;
+    if (lean_is_exclusive(v_state)) {
+        reuse_state = v_state;
+    } else {
+        lean_inc(visited);
+        lean_inc(mctx);
+        lean_dec_ref(v_state);
+        reuse_state = nullptr;
+    }
+
+    bool res;
+    {
+        depends_on_fn fn(v_pf, v_pm, mctx);
+        res = fn.visit(v_e);
+        mctx = fn.m_mctx;
+    }
+
+    lean_dec_ref(v_e);
+    lean_dec_ref(v_pm);
+    lean_dec_ref(v_pf);
+
+    lean_object * new_state;
+    if (reuse_state != nullptr) {
+        lean_ctor_set(reuse_state, 0, visited);
+        lean_ctor_set(reuse_state, 1, mctx);
+        new_state = reuse_state;
+    } else {
+        new_state = lean_alloc_ctor(0, 2, 0);
+        lean_ctor_set(new_state, 0, visited);
+        lean_ctor_set(new_state, 1, mctx);
+    }
+
+    lean_object * pair = lean_alloc_ctor(0, 2, 0);
+    lean_ctor_set(pair, 0, lean_box(res ? 1 : 0));
+    lean_ctor_set(pair, 1, new_state);
+    return pair;
 }
 }

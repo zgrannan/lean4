@@ -25,17 +25,13 @@ struct expr_eq_cache {
         uint32_t      epoch;
     };
     slot     m_slots[CAPACITY];
-    uint32_t m_epoch = 1;
+    uint32_t m_epoch = 0;
     uint32_t m_depth = 0;
 
-    expr_eq_cache() {
-        std::memset(m_slots, 0, sizeof(m_slots));
-    }
-
     uint32_t enter() {
-        if (m_depth == 0 && m_epoch > 0xFFFF0000u) {
+        if (LEAN_UNLIKELY(m_depth == 0 && m_epoch > 0xFFFF0000u)) {
             std::memset(m_slots, 0, sizeof(m_slots));
-            m_epoch = 1;
+            m_epoch = 0;
         }
         ++m_depth;
         return ++m_epoch;
