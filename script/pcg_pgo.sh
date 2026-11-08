@@ -19,7 +19,9 @@ mkdir -p "$build" "$gcda"
 configure() { # FLAGS LINKER_FLAGS
   (cd "$build" && cmake "$src" -DCMAKE_BUILD_TYPE=Release -DSTRIP_BINARIES=OFF \
     -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
-    -DLEAN_EXTRA_CXX_FLAGS="$1" -DLEANC_EXTRA_CC_FLAGS="$1" -DLEAN_EXTRA_LINKER_FLAGS="$2")
+    -DCADICAL_EXTRA_CXX_FLAGS="-fno-reorder-blocks-and-partition" \
+    -DLEAN_EXTRA_CXX_FLAGS="$1" -DLEANC_EXTRA_CC_FLAGS="$1" \
+    -DLEAN_EXTRA_LINKER_FLAGS="-Wl,--emit-relocs $2")
 }
 
 source "$src/script/pcg_pgo_flags.sh"

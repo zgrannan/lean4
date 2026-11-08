@@ -5,10 +5,10 @@
 pgo_flags() {
   case $1 in
     generate)
-      echo "-fprofile-generate -fprofile-update=prefer-atomic -fprofile-dir=$2 ${3:-}" ;;
+      echo "-fprofile-generate -fprofile-update=prefer-atomic -fprofile-dir=$2 -fno-reorder-blocks-and-partition ${3:-}" ;;
     use)
       echo "-fprofile-use -fprofile-dir=$2 -fprofile-correction -fprofile-partial-training" \
-        "-Wno-missing-profile -Wno-coverage-mismatch ${3:-}" ;;
+        "-fno-reorder-blocks-and-partition -Wno-missing-profile -Wno-coverage-mismatch ${3:-}" ;;
     *)
       echo "pgo_flags: unknown mode $1" >&2
       return 1 ;;

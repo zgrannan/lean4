@@ -17,9 +17,9 @@ on:
   workflow_dispatch:
     inputs:
       pgo:
-        description: "instrument: publish the instrumented compiler that records a profile"
+        description: "instrument: GCC PGO instrumentation; bolt-instrument: BOLT instrumentation on PGO build"
         type: choice
-        options: [auto, instrument]
+        options: [auto, instrument, bolt-instrument]
         default: auto
 
 concurrency:
@@ -47,24 +47,36 @@ jobs:
       # the profile names the object files by their absolute path, which must be the same in the
       # instrumented and the profile-guided build
       GCDA: ${{ github.workspace }}/pgo-gcda
+      BOLT_FDATA_DIR: /tmp/bolt-fdata
     steps:
       - uses: actions/checkout@v4
 
       - name: Select the optimization mode
         run: |
           profile=script/pgo/profile-${{ matrix.arch }}.tar.xz
+          bolt_profile=script/pgo/bolt-${{ matrix.arch }}.fdata.xz
           if [ "${{ inputs.pgo }}" = instrument ]; then
             echo "PGO_MODE=instrument" >> "$GITHUB_ENV"
+            echo "BOLT_MODE=none" >> "$GITHUB_ENV"
+          elif [ "${{ inputs.pgo }}" = bolt-instrument ]; then
+            echo "PGO_MODE=use" >> "$GITHUB_ENV"
+            echo "BOLT_MODE=instrument" >> "$GITHUB_ENV"
           elif [ -f "$profile" ]; then
             echo "PGO_MODE=use" >> "$GITHUB_ENV"
+            if [ -f "$bolt_profile" ]; then
+              echo "BOLT_MODE=use" >> "$GITHUB_ENV"
+            else
+              echo "BOLT_MODE=none" >> "$GITHUB_ENV"
+            fi
           else
             echo "PGO_MODE=plain" >> "$GITHUB_ENV"
+            echo "BOLT_MODE=none" >> "$GITHUB_ENV"
           fi
 
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ccache libgmp-dev libuv1-dev libssl-dev pkgconf
+          sudo apt-get install -y cmake ccache libgmp-dev libuv1-dev libssl-dev pkgconf bolt-19 libbolt-19-dev
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -100,16 +112,17 @@ jobs:
       - name: Configure
         run: |
           source script/pcg_pgo_flags.sh
-          ldflags="-Wl,--as-needed -lgmp -luv -lssl -lcrypto -lpthread -ldl -lrt -Wl,--no-as-needed"
+          ldflags="-Wl,--emit-relocs -Wl,--as-needed -lgmp -luv -lssl -lcrypto -lpthread -ldl -lrt -Wl,--no-as-needed"
           case "$PGO_MODE" in
             instrument) flags=$(pgo_flags generate "$GCDA" "${{ matrix.march }}")
                         ldflags="$ldflags -fprofile-generate" ;;
             use)        flags=$(pgo_flags use "$GCDA" "${{ matrix.march }}") ;;
-            plain)      flags="${{ matrix.march }}" ;;
+            plain)      flags="-fno-reorder-blocks-and-partition ${{ matrix.march }}" ;;
           esac
           cmake -S . -B build \
-            -DCMAKE_BUILD_TYPE=Release -DSTRIP_BINARIES=ON -DWFAIL=OFF \
+            -DCMAKE_BUILD_TYPE=Release -DSTRIP_BINARIES=OFF -DWFAIL=OFF \
             -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
+            -DCADICAL_EXTRA_CXX_FLAGS="-fno-reorder-blocks-and-partition" \
             -DLEAN_STANDALONE=ON \
             "-DLEAN_EXTRA_LINKER_FLAGS=$ldflags" \
             "-DLEAN_EXTRA_CXX_FLAGS=$flags" "-DLEANC_EXTRA_CC_FLAGS=$flags"
@@ -118,7 +131,7 @@ jobs:
         run: make -C build -j"$(nproc)"
 
       - name: Test elaboration and compilation
-        if: env.PGO_MODE != 'instrument'
+        if: env.PGO_MODE != 'instrument' && env.BOLT_MODE != 'instrument'
         run: |
           ctest --test-dir build/stage1 --output-on-failure \
             --parallel "$(nproc)" --no-tests=error \
@@ -134,10 +147,44 @@ jobs:
           cp -L "$libdir/libuv.so.1" "dist/$TOOLCHAIN/lib/lean/"
           cp "$libdir"/{libuv,libgmp,libssl,libcrypto}.a "dist/$TOOLCHAIN/lib/lean/"
 
+      - name: Apply LLVM BOLT to libleanshared.so
+        run: |
+          so="dist/$TOOLCHAIN/lib/lean/libleanshared.so"
+          bolt=/usr/lib/llvm-19/bin/llvm-bolt
+          case "$BOLT_MODE" in
+            instrument)
+              "$bolt" "$so" -o "$so.bolt" \
+                --skip-funcs='^(runtime_initialize_|meta_initialize_|initialize_|.*___regBuiltin_|.*___closed__|.*_initFn_|lean_obj_once|l_Lean_Lsp_|l_Lean_Server_|l_Lean_Widget_|l_Std_Http_|l_Std_Time_).*' \
+                --instrument \
+                --instrumentation-file="$BOLT_FDATA_DIR/prof.fdata" \
+                --instrumentation-file-append-pid
+              mv "$so.bolt" "$so"
+              ;;
+            use)
+              xz -dc "script/pgo/bolt-${{ matrix.arch }}.fdata.xz" > "$RUNNER_TEMP/bolt.fdata"
+              "$bolt" "$so" -o "$so.bolt" \
+                -data="$RUNNER_TEMP/bolt.fdata" \
+                -reorder-blocks=ext-tsp \
+                -reorder-functions=cdsort \
+                -split-functions \
+                -split-all-cold \
+                -split-eh \
+                -icf=1 \
+                --infer-stale-profile=1 \
+                --remove-symtab \
+                -dyno-stats
+              mv "$so.bolt" "$so"
+              ;;
+            none)
+              strip --strip-unneeded "$so"
+              ;;
+          esac
+
       - name: Smoke test
         run: |
           # an instrumented compiler writes its counters at exit
           export GCOV_PREFIX="$RUNNER_TEMP/smoke-gcda"
+          mkdir -p "$BOLT_FDATA_DIR"
           export PATH="$PWD/dist/$TOOLCHAIN/bin:$PATH"
           lean --version
           lake --version
@@ -150,6 +197,7 @@ jobs:
           lean Main.lean -c main.c
           leanc main.c -o hello
           ./hello
+          rm -rf "$BOLT_FDATA_DIR"
 
       - name: Package
         # a plain tar: the artifact upload compresses it, and the consumer needs nothing but Python
@@ -157,8 +205,8 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.PGO_MODE == 'instrument' && 'pcg-lean-pgo-instrumented' || 'pcg-lean-linux' }}_${{ matrix.arch }}
+          name: ${{ (env.PGO_MODE == 'instrument' || env.BOLT_MODE == 'instrument') && 'pcg-lean-pgo-instrumented' || 'pcg-lean-linux' }}_${{ matrix.arch }}
           path: ${{ env.TOOLCHAIN }}.tar
           compression-level: 6
-          retention-days: ${{ env.PGO_MODE == 'instrument' && 14 || 90 }}
+          retention-days: ${{ (env.PGO_MODE == 'instrument' || env.BOLT_MODE == 'instrument') && 14 || 90 }}
           if-no-files-found: error
